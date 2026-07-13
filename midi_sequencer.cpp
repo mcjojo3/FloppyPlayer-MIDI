@@ -7,6 +7,7 @@
 static const uint8_t MIDI_EVT_OTHER_INTERNAL = 2;
 static const uint8_t MIDI_EVT_CC_INTERNAL = 201; // channel in pendingChannel, controller# in pendingA, value in pendingB
 static const uint8_t MIDI_EVT_TEMPO_INTERNAL = 200;
+static const uint8_t MIDI_EVT_PROGRAM_INTERNAL = 202; // channel in pendingChannel, program# in pendingA
 
 // Loads up to MIDI_SEQ_HALF_WINDOW_BYTES starting at the sector containing
 // requestedStart (window starts are always sector-aligned).
@@ -40,15 +41,27 @@ static bool loadWindowAt(MidiSequencer *seq, uint32_t requestedStart, uint8_t *b
 static bool nextByte(MidiSequencer *seq, MidiTrackCursor *tc, uint8_t *out, bool allowBlockingRead, bool *stalled) {
   if (tc->pos >= seq->fileHandle.fileSize) return false; // real end, not a stall
 
-  if (tc->pos < tc->activeBase || tc->pos >= tc->activeBase + tc->activeValidBytes) {
+  // Snapshot the volatile active-window fields once - nothing but this
+  // function ever writes them, so they can't change mid-call; re-reading
+  // each on every use just forces redundant memory loads.
+  uint32_t activeBase = tc->activeBase;
+  uint32_t activeValidBytes = tc->activeValidBytes;
+  int activeHalf = tc->activeHalf;
+
+  if (tc->pos < activeBase || tc->pos >= activeBase + activeValidBytes) {
     if (tc->preloadValid && tc->pos >= tc->preloadBase && tc->pos < tc->preloadBase + tc->preloadValidBytes) {
-      tc->activeHalf = 1 - tc->activeHalf;
-      tc->activeBase = tc->preloadBase;
-      tc->activeValidBytes = tc->preloadValidBytes;
+      activeHalf = 1 - activeHalf;
+      activeBase = tc->preloadBase;
+      activeValidBytes = tc->preloadValidBytes;
+      tc->activeHalf = activeHalf;
+      tc->activeBase = activeBase;
+      tc->activeValidBytes = activeValidBytes;
       tc->preloadValid = false;
     } else if (allowBlockingRead) {
       uint32_t base, validBytes;
-      if (!loadWindowAt(seq, tc->pos, tc->half[tc->activeHalf], &base, &validBytes)) return false; // real disk error, not a stall
+      if (!loadWindowAt(seq, tc->pos, tc->half[activeHalf], &base, &validBytes)) return false; // real disk error, not a stall
+      activeBase = base;
+      activeValidBytes = validBytes;
       tc->activeBase = base;
       tc->activeValidBytes = validBytes;
       tc->preloadValid = false; // any old preload is now for the wrong position - discard it
@@ -56,10 +69,10 @@ static bool nextByte(MidiSequencer *seq, MidiTrackCursor *tc, uint8_t *out, bool
       *stalled = true;
       return false;
     }
-    if (tc->pos >= tc->activeBase + tc->activeValidBytes) return false; // truly out of data - real end, not a stall
+    if (tc->pos >= activeBase + activeValidBytes) return false; // truly out of data - real end, not a stall
   }
 
-  *out = tc->half[tc->activeHalf][tc->pos - tc->activeBase];
+  *out = tc->half[activeHalf][tc->pos - activeBase];
   tc->pos++;
   return true;
 }
@@ -79,19 +92,13 @@ static bool readVarlen(MidiSequencer *seq, MidiTrackCursor *tc, uint32_t *outVal
 }
 
 // Decodes this track's next event into tc->pending* (pendingValid=true), or
-// sets tc->finished=true once genuinely exhausted. Surfaces
-// NOTE_ON/NOTE_OFF/CC/OTHER/TEMPO_INTERNAL alike - advanceSequencer()
-// decides what to do with each.
+// sets tc->finished=true once exhausted. Surfaces NOTE_ON/NOTE_OFF/CC/OTHER/
+// TEMPO_INTERNAL alike - advanceSequencer() decides what to do with each.
 //
-// With allowBlockingRead=false, a nextByte()/readVarlen() call partway
-// through decoding one event can "stall". Since an event's bytes span
-// several calls with no persisted state beyond
-// tc->pos/absTick/runningStatus, a stall must not leave those half-updated -
-// the whole decode has to look like it never started, so it's safe to
-// retry later. Snapshotting those fields (plus the double-buffer
-// bookkeeping - a swap can happen mid-event if a byte boundary lands right
-// at a window edge) at entry and restoring them on a stall gives exactly
-// that.
+// A stall partway through decoding one event must not leave pos/absTick/
+// runningStatus (or the double-buffer bookkeeping, which can swap mid-event)
+// half-updated, so all of it is snapshotted at entry and restored on a stall -
+// the decode looks like it never started, safe to retry.
 static void advanceTrack(MidiSequencer *seq, MidiTrackCursor *tc, bool allowBlockingRead) {
   uint32_t savedPos = tc->pos;
   uint32_t savedAbsTick = tc->absTick;
@@ -188,7 +195,7 @@ static void advanceTrack(MidiSequencer *seq, MidiTrackCursor *tc, bool allowBloc
           if (!nextByte(seq, tc, &d1, allowBlockingRead, &stalled)) { onFailure(); return; }
         }
         tc->pendingTick = tc->absTick;
-        tc->pendingType = MIDI_EVT_OTHER_INTERNAL;
+        tc->pendingType = (eventType == 0xC0) ? MIDI_EVT_PROGRAM_INTERNAL : MIDI_EVT_OTHER_INTERNAL;
         tc->pendingChannel = channel;
         tc->pendingA = d1;
         tc->pendingB = 0;
@@ -228,19 +235,16 @@ static void advanceTrack(MidiSequencer *seq, MidiTrackCursor *tc, bool allowBloc
 // before looping to find the next candidate.
 static void advanceSequencer(MidiSequencer *seq, bool allowBlockingRead) {
   while (true) {
-    // Re-prime any track without a pending event - either never primed, or
-    // a previous advanceTrack() stalled. advanceTrack() fully rolls back on
-    // a stall, so retrying here is always safe, and runs every pass so a
-    // stalled track gets retried on the very next iteration too.
-    for (int i = 0; i < seq->trackCount; i++) {
-      MidiTrackCursor &tc = seq->tracks[i];
-      if (!tc.finished && !tc.pendingValid) advanceTrack(seq, &tc, allowBlockingRead);
-    }
-
+    // Re-prime any track without a pending event (either never primed, or a
+    // previous advanceTrack() stalled - safe to retry every pass since it
+    // fully rolls back on a stall) and fold straight into the tick-minimum
+    // search - one pass instead of two, since priming track i never affects
+    // track j's tick.
     int bestIndex = -1;
     uint32_t bestTick = 0;
     for (int i = 0; i < seq->trackCount; i++) {
       MidiTrackCursor &tc = seq->tracks[i];
+      if (!tc.finished && !tc.pendingValid) advanceTrack(seq, &tc, allowBlockingRead);
       if (tc.finished || !tc.pendingValid) continue;
       if (bestIndex == -1 || tc.pendingTick < bestTick) {
         bestIndex = i;
@@ -278,6 +282,12 @@ static void advanceSequencer(MidiSequencer *seq, bool allowBlockingRead) {
       advanceTrack(seq, &tc, allowBlockingRead);
       continue;
     }
+    if (type == MIDI_EVT_PROGRAM_INTERNAL) {
+      if (channel < 16) seq->channelProgram[channel] = a;
+      tc.pendingValid = false;
+      advanceTrack(seq, &tc, allowBlockingRead);
+      continue;
+    }
     if (type == MIDI_EVT_OTHER_INTERNAL) {
       tc.pendingValid = false;
       advanceTrack(seq, &tc, allowBlockingRead);
@@ -289,8 +299,11 @@ static void advanceSequencer(MidiSequencer *seq, bool allowBlockingRead) {
     seq->pending.channel = channel;
     seq->pending.note = a;
     // Scale by this channel's CC7 (Channel Volume) - GM files commonly set
-    // this per channel to balance the mix.
-    seq->pending.velocity = (uint8_t)(((uint32_t)b * seq->channelVolume[channel < 16 ? channel : 0]) / 127);
+    // this per channel to balance the mix. >>7 (divide by 128) instead of
+    // /127 - off by at most 1/127 at the very top of the range, inaudible,
+    // and avoids a divide with no hardware divider on this chip.
+    seq->pending.velocity = (uint8_t)(((uint32_t)b * seq->channelVolume[channel < 16 ? channel : 0]) >> 7);
+    seq->pending.program = seq->channelProgram[channel < 16 ? channel : 0];
     seq->pendingValid = true;
     tc.pendingValid = false;
     advanceTrack(seq, &tc, allowBlockingRead);
@@ -372,6 +385,7 @@ bool midi_seq_init(MidiSequencer *seq, const FloppyDirEntry &entry) {
   seq->lastTick = 0;
   seq->lastTimeUs = 0;
   for (int c = 0; c < 16; c++) seq->channelVolume[c] = 127; // full volume until a real CC7 says otherwise
+  for (int c = 0; c < 16; c++) seq->channelProgram[c] = 0; // Acoustic Grand Piano until a real Program Change says otherwise
   advanceSequencer(seq, true);
   return true;
 }

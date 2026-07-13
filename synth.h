@@ -1,8 +1,9 @@
-// synth.h - simple polyphonic sine + linear ADSR synth (chiptune-style
-// rendition, not real GM instrument sounds). Oscillator/envelope math uses
-// precomputed lookup tables, not live sinf()/sqrtf()/powf() - this chip's
-// Cortex-M0+ cores have no hardware FPU, and those calls are too slow for
-// the audio hot path.
+// synth.h - simple polyphonic synth (chiptune-style rendition, not real GM
+// instrument sounds) with linear ADSR and a sine/saw/square oscillator
+// chosen per voice from its GM program number. Oscillator/envelope math
+// uses precomputed lookup tables and phase-accumulator arithmetic, not live
+// sinf()/sqrtf()/powf() - this chip's Cortex-M0+ cores have no hardware
+// FPU, and those calls are too slow for the audio hot path.
 #pragma once
 #include <stdint.h>
 
@@ -10,7 +11,10 @@
 // sample rate, to build the note-frequency step table correctly.
 void synth_init(uint32_t sampleRate);
 
-void synth_note_on(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t nowUs);
+// program is the channel's current GM program number (0-127), used to pick
+// a rougher waveform for brighter/percussive instruments instead of always
+// using a pure sine (see waveformForProgram() in synth.cpp).
+void synth_note_on(uint8_t channel, uint8_t note, uint8_t velocity, uint8_t program, uint32_t nowUs);
 void synth_note_off(uint8_t channel, uint8_t note, uint32_t nowUs);
 // Starts every active voice's normal release fade (same curve as
 // synth_note_off()) instead of an instant cutoff - avoids an audible pop.

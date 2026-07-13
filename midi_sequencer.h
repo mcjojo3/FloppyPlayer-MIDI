@@ -1,21 +1,9 @@
-// midi_sequencer.h - streaming SMF parser/scheduler. See README.md for the
-// double-buffering and timer-dispatch design; the short version:
-//
-// Each track cursor keeps two half-size window buffers and double-buffers
-// between them (read from the active half; once past 10% consumed,
-// midi_seq_maintain() proactively loads the next chunk into the inactive
-// half, so the swap is instant when playback reaches it). A synchronous
-// fallback exists for the rare case preloading didn't finish in time.
-//
-// Multi-track (SMF format 1) files are handled via a live K-way merge, one
-// cursor per track, always dispatching whichever track's next event has the
-// smallest tick. Single-track (format 0) is just the ntrks==1 case.
-//
-// midi_seq_advance()'s allowBlockingRead=false path (used from the dispatch
-// timer interrupt) never touches the floppy: if a byte isn't already
-// preloaded, nextByte() reports a "stall" instead of blocking, and the
-// track is retried on the next call once midi_seq_maintain() (main loop
-// only) catches up.
+// midi_sequencer.h - streaming SMF parser/scheduler (see README.md for the
+// full design). Each track double-buffers two window halves, proactively
+// refilling the inactive one past 10% consumed. Multi-track files use a
+// live K-way merge by tick across per-track cursors. allowBlockingRead=false
+// (used from the dispatch ISR) never touches the floppy - a missing byte
+// reports a "stall" instead of blocking, retried once midi_seq_maintain() catches up.
 #pragma once
 #include <stdint.h>
 #include "floppy_fat12.h"
@@ -31,6 +19,7 @@ struct MidiEvent {
   uint8_t channel;
   uint8_t note;
   uint8_t velocity;
+  uint8_t program; // this channel's current GM program number (0-127), for timbre selection
 };
 
 #define MIDI_SEQ_MAX_TRACKS 24 // covers any SMF format-1 file with headroom
@@ -48,13 +37,10 @@ struct MidiTrackCursor {
   uint8_t pendingType; // MidiEventType, or an internal marker (tempo/CC/other) - see .cpp
   uint8_t pendingChannel, pendingA, pendingB;
 
-  // Double-buffered read-ahead window. preloadValid is the single-bool
-  // guard that makes the producer(main loop)/consumer(dispatch interrupt)
-  // handoff safe without a lock: the producer writes the buffer and
-  // preloadBase/preloadValidBytes FIRST and sets preloadValid=true LAST;
-  // the consumer only trusts them after observing preloadValid==true.
-  // volatile so the compiler can't reorder/cache these across the
-  // interrupt boundary.
+  // Double-buffered read-ahead window. preloadValid is the lock-free guard:
+  // producer (main loop) writes preloadBase/preloadValidBytes then sets
+  // preloadValid=true LAST; consumer (dispatch ISR) only trusts them after
+  // seeing it true. volatile so the compiler can't reorder these.
   uint8_t half[2][MIDI_SEQ_HALF_WINDOW_BYTES];
   volatile int activeHalf;
   volatile uint32_t activeBase;
@@ -82,6 +68,9 @@ struct MidiSequencer {
   // Per-channel Control Change 7 (Channel Volume), applied to each
   // NOTE_ON's velocity. Defaults to 127 until a real CC7 says otherwise.
   uint8_t channelVolume[16];
+  // Per-channel Program Change (GM instrument number), applied to each
+  // NOTE_ON for timbre selection. Defaults to 0 (Acoustic Grand Piano).
+  uint8_t channelProgram[16];
 
   bool pendingValid;
   MidiEvent pending; // next NOTE_ON/NOTE_OFF event to fire, already tick->time_us converted
@@ -95,33 +84,25 @@ bool midi_seq_init(MidiSequencer *seq, const FloppyDirEntry &entry);
 // call midi_seq_advance() to move past it once its time has come).
 bool midi_seq_peek(MidiSequencer *seq, MidiEvent *out);
 
-// Consumes the current pending event and computes the next one.
-// allowBlockingRead=true permits a synchronous disk read (only safe from
-// the main loop, never the dispatch timer interrupt). allowBlockingRead=false
-// never touches the floppy - if data isn't ready, that track is left
-// without a pending event (not marked finished) and retried next call.
+// Consumes the pending event and computes the next one. allowBlockingRead=true
+// permits a synchronous disk read (main loop only, never the dispatch ISR);
+// =false never touches the floppy, leaving an unready track to retry next call.
 void midi_seq_advance(MidiSequencer *seq, bool allowBlockingRead);
 
-// True only once every track is genuinely exhausted - unlike
-// !midi_seq_peek(), which is also (indistinguishably) true during a
-// transient stall. Only call this (and act on the result) from the main
-// loop - acting on "finished" means loading the next track, which blocks.
+// True only once every track is genuinely exhausted - unlike !midi_seq_peek(),
+// which is also true during a transient stall. Main-loop only: acting on
+// "finished" means loading the next track, which blocks.
 bool midi_seq_all_tracks_finished(MidiSequencer *seq);
 
 // Diagnostic: Serial-prints every track's cursor state.
 void midi_seq_debug_dump(MidiSequencer *seq);
 
-// Call frequently (e.g. every loop() iteration), independent of dispatch
-// timing - tops up any track whose window is running low, and gives up on
-// (marks finished) a track stuck retrying the same position for too long
-// (see MIDI_SEQ_MAINTAIN_GIVE_UP_MS in the .cpp) rather than blocking
-// playback forever.
+// Call every loop() iteration: tops up any track running low, and gives up
+// on (marks finished) a track stuck at the same position too long (see
+// MIDI_SEQ_MAINTAIN_GIVE_UP_MS in the .cpp) rather than blocking forever.
 void midi_seq_maintain(MidiSequencer *seq);
 
-// True if any non-finished track has been stuck retrying the same preload
-// position for at least minMs - a genuine buffer-starvation stall, not a
-// false positive from an ordinary long note/rest (those never touch this
-// state, since the buffer stays topped up regardless of note density).
-// Intended for a caller to proactively silence current notes while
-// waiting, instead of leaving a stuck note audibly droning.
+// True if any track has been stuck at the same preload position for at
+// least minMs - a genuine buffer-starvation stall, never a false positive
+// from an ordinary long note/rest. Meant for a caller to mute proactively.
 bool midi_seq_any_track_stalled(MidiSequencer *seq, uint32_t minMs);

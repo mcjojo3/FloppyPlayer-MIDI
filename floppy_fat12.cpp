@@ -156,6 +156,14 @@ static inline void __not_in_flash_func(emitBit)(int bit) {
   pushBit(bit);
 }
 
+// 48-bit Hamming distance via two 32-bit popcounts instead of one 64-bit
+// popcount - both inputs are always 48-bit-masked, so the 64-bit variant
+// would spend cycles on 16 bits that are provably always zero.
+static inline int __not_in_flash_func(hammingDistance48)(uint64_t a, uint64_t b) {
+  uint64_t x = a ^ b;
+  return __builtin_popcount((uint32_t)x) + __builtin_popcount((uint32_t)(x >> 32));
+}
+
 // Sync-candidate search runs as a post-pass over the completed revolution,
 // not inline during capture - the timing-critical FIFO-draining loop can't
 // afford a software popcount (no hardware POPCNT) on every bit without
@@ -167,7 +175,7 @@ static void __not_in_flash_func(findSyncCandidates)() {
     window = (window << 1) | (uint64_t)getBit(pos);
     if (pos + 1 >= 48) {
       uint64_t window48 = window & 0xFFFFFFFFFFFFULL;
-      int mismatches = __builtin_popcountll(window48 ^ SYNC_PATTERN_48);
+      int mismatches = hammingDistance48(window48, SYNC_PATTERN_48);
       if (mismatches <= SYNC_TOLERANCE && candidateCount < MAX_CANDIDATES) {
         candidatePositions[candidateCount++] = pos + 1 - 48;
       }
@@ -282,14 +290,26 @@ static bool __not_in_flash_func(decodeBytesAt)(uint32_t pos, int n, uint8_t *out
   return true;
 }
 
+// Table-driven CRC16-CCITT: same result as the bit-loop it replaces, one
+// table lookup per byte instead of 8 shift-and-branch iterations. Called on
+// every IDAM candidate (up to a few hundred per track) and every sector
+// payload, so this adds up across a cylinder read's retries.
+static uint16_t crc16Table[256];
+
+static void initCrc16Table() {
+  for (int i = 0; i < 256; i++) {
+    uint16_t crc = (uint16_t)i << 8;
+    for (int b = 0; b < 8; b++) {
+      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+    }
+    crc16Table[i] = crc;
+  }
+}
+
 static uint16_t __not_in_flash_func(crc16_ccitt)(const uint8_t *data, int len) {
   uint16_t crc = 0xFFFF;
   for (int i = 0; i < len; i++) {
-    crc ^= (uint16_t)data[i] << 8;
-    for (int b = 0; b < 8; b++) {
-      if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
-      else crc = crc << 1;
-    }
+    crc = (crc << 8) ^ crc16Table[((crc >> 8) ^ data[i]) & 0xFF];
   }
   return crc;
 }
@@ -337,7 +357,7 @@ static bool __not_in_flash_func(findDam)(uint32_t searchStart, uint8_t *outMark,
     } else {
       window &= 0xFFFFFFFFFFFFULL;
     }
-    int mismatches = __builtin_popcountll(window ^ SYNC_PATTERN_48);
+    int mismatches = hammingDistance48(window, SYNC_PATTERN_48);
     if (mismatches <= DAM_SYNC_TOLERANCE && (best == -1 || mismatches < best)) {
       best = mismatches;
       bestPos = pos;
@@ -442,9 +462,7 @@ static bool __not_in_flash_func(captureOneRevolutionToCellbits)() {
       continue;
     }
     uint16_t data = fifoRead();
-    int32_t delta = (int32_t)last - (int32_t)data;
-    if (delta < 0) delta += 65536;
-    delta /= 2;
+    int32_t delta = (uint16_t)(last - data) >> 1; // wraps mod 65536, then halves - no branch needed
     last = data;
 
     feedRawDelta(delta);
@@ -716,6 +734,7 @@ static int parseDirectoryBytes(const uint8_t *buf, uint32_t len, FloppyDirEntry 
 }
 
 bool floppy_init() {
+  initCrc16Table();
   pinMode(pinDriveSelect, OUTPUT);
   pinMode(pinMotorEnable, OUTPUT);
   pinMode(pinDirection, OUTPUT);

@@ -201,6 +201,11 @@ void applyAutoplaySwitch() {
 uint32_t songElapsedBeforePauseUs = 0;
 uint32_t playSegmentStartUs = 0;
 
+// See checkStallClock() - lets a disk stall pause playSegmentStartUs's advance too.
+const uint32_t CLOCK_STALL_THRESHOLD_MS = 20;
+static bool clockPausedForStall = false;
+static uint32_t stallPauseStartUs = 0;
+
 MidiSequencer midiSeq;
 // volatile: read every tick by the dispatch timer interrupt, written by
 // loop() (loadCurrentTrack) - guards the ISR from touching midiSeq mid-rewrite
@@ -279,6 +284,7 @@ void loadCurrentTrack() {
     return;
   }
   playSegmentStartUs = micros(); // before midiSeqValid, not after - avoids the ISR reading a stale clock baseline
+  clockPausedForStall = false; // a stall from the previous track must not carry over onto this fresh baseline
   midiSeqValid = true;
   Serial.print("  loaded in ");
   Serial.print(millis() - start);
@@ -287,21 +293,35 @@ void loadCurrentTrack() {
   Serial.println(" track(s)");
 }
 
-// Core 1 owns all synth voice state exclusively - commands cross via the
-// inter-core FIFO instead of calling synth_note_on/off directly.
+// Core 1 owns all synth voice state - commands cross via a software ring
+// buffer, since the hardware inter-core FIFO (only 8 entries) can overflow
+// and silently drop commands during a dense chord.
 // Encoding: bit31 set = control command (only ALL_NOTES_OFF exists);
-// otherwise bit30=note-on/off, bits27-24=channel, bits23-16=note, bits15-8=velocity.
+// otherwise bit30=note-on/off, bits27-24=channel, bits23-16=note, bits15-8=velocity, bits7-0=GM program.
 const uint32_t FIFO_CMD_ALL_NOTES_OFF = 0x80000000u;
 
-void sendNoteCommand(bool isOn, uint8_t channel, uint8_t note, uint8_t velocity) {
+#define NOTE_CMD_QUEUE_SIZE 128
+static volatile uint32_t noteCmdQueue[NOTE_CMD_QUEUE_SIZE];
+static volatile uint32_t noteCmdHead = 0; // producer-owned (Core 0 dispatch ISR)
+static volatile uint32_t noteCmdTail = 0; // consumer-owned (Core 1 loop1())
+
+// Lock-free SPSC push - safe on this chip's in-order cores without a memory barrier.
+static inline bool noteCmdPush(uint32_t cmd) {
+  uint32_t next = (noteCmdHead + 1) % NOTE_CMD_QUEUE_SIZE;
+  if (next == noteCmdTail) return false; // full - vanishingly unlikely at this size
+  noteCmdQueue[noteCmdHead] = cmd;
+  noteCmdHead = next;
+  return true;
+}
+
+void sendNoteCommand(bool isOn, uint8_t channel, uint8_t note, uint8_t velocity, uint8_t program) {
   uint32_t cmd = ((uint32_t)(isOn ? 1 : 0) << 30) | ((uint32_t)(channel & 0x0F) << 24) |
-                 ((uint32_t)note << 16) | ((uint32_t)velocity << 8);
-  rp2040.fifo.push_nb(cmd); // non-blocking - this runs from the dispatch ISR, which must never block
-  lastNoteCommandMs = millis();
+                 ((uint32_t)note << 16) | ((uint32_t)velocity << 8) | (uint32_t)program;
+  noteCmdPush(cmd); // must not block - this runs from the dispatch ISR
 }
 
 void sendAllNotesOff() {
-  rp2040.fifo.push(FIFO_CMD_ALL_NOTES_OFF);
+  while (!noteCmdPush(FIFO_CMD_ALL_NOTES_OFF)) {} // called from loop(), not the ISR - fine to spin briefly
 }
 
 void resetPlayback() {
@@ -373,18 +393,16 @@ void togglePlayPause() {
   printState();
 }
 
-// -40..0dB logarithmic taper (loudness perception is logarithmic, not
-// linear) precomputed once - not per-sample, since this chip has no
-// hardware FPU and powf() is too slow for the audio hot path. Both the
-// buttons (11 discrete steps) and the pot (continuous) write to
-// currentAmplitude; whichever was used more recently wins.
+// -50..0dB logarithmic taper, precomputed once (no hardware FPU, powf() is
+// too slow per-sample). Buttons and pot both write currentAmplitude - most recent wins.
+const float VOLUME_FLOOR_DB = -50.0f;
 float volumeTable[11];
 volatile float currentAmplitude;
 
 void buildVolumeTable() {
   volumeTable[0] = 0.0f;
   for (int v = 1; v <= 10; v++) {
-    float dB = -40.0f + (v / 10.0f) * 40.0f;
+    float dB = VOLUME_FLOOR_DB + (v / 10.0f) * -VOLUME_FLOOR_DB;
     volumeTable[v] = powf(10.0f, dB / 20.0f);
   }
   currentAmplitude = volumeTable[volume];
@@ -409,7 +427,7 @@ void setupVolumePot() {
   analogReadResolution(12); // RP2040's ADC is genuinely 12-bit, vs the classic-Arduino 10-bit default
 }
 
-// Same -40..0dB taper as the button table, driven by a continuous fraction.
+// Same taper as the button table, driven by a continuous fraction.
 // Only recomputes when the reading moves more than ADC noise would.
 void updateVolumePot() {
   int raw = analogRead(PIN_VOL_POT);
@@ -420,7 +438,7 @@ void updateVolumePot() {
     return;
   }
   float fraction = raw / 4095.0f;
-  float dB = -40.0f + fraction * 40.0f;
+  float dB = VOLUME_FLOOR_DB + fraction * -VOLUME_FLOOR_DB;
   currentAmplitude = powf(10.0f, dB / 20.0f);
 }
 
@@ -433,10 +451,8 @@ void setupAudio() {
   pwmAudio.begin(AUDIO_SAMPLE_RATE);
 }
 
-// Called every loop1() iteration (Core 1). Always calls synth_sample() - no
-// `playing` gate, since that would itself jump straight to 0.0f on pause (an
-// audible click); pausing relies on synth_all_notes_off()'s smooth release
-// to reach silence instead.
+// No `playing` gate here - that would itself pop to 0.0f on pause. Pausing
+// relies on synth_all_notes_off()'s smooth release instead.
 void fillAudioBuffer() {
   while (pwmAudio.availableForWrite() >= 2) {
     float s = synth_sample(micros());
@@ -450,8 +466,9 @@ void fillAudioBuffer() {
 
 // Runs on Core 1 - the only core allowed to touch synth's voice state.
 void drainNoteCommands() {
-  uint32_t cmd;
-  while (rp2040.fifo.pop_nb(&cmd)) {
+  while (noteCmdTail != noteCmdHead) {
+    uint32_t cmd = noteCmdQueue[noteCmdTail];
+    noteCmdTail = (noteCmdTail + 1) % NOTE_CMD_QUEUE_SIZE;
     if (cmd == FIFO_CMD_ALL_NOTES_OFF) {
       synth_all_notes_off(micros());
       continue;
@@ -460,33 +477,36 @@ void drainNoteCommands() {
     uint8_t channel = (cmd >> 24) & 0x0F;
     uint8_t note = (cmd >> 16) & 0xFF;
     uint8_t velocity = (cmd >> 8) & 0xFF;
+    uint8_t program = cmd & 0xFF;
     uint32_t now = micros();
-    if (isOn) synth_note_on(channel, note, velocity, now);
+    if (isOn) synth_note_on(channel, note, velocity, program, now);
     else synth_note_off(channel, note, now);
   }
 }
 
-// Called from the dispatch timer interrupt (midiDispatchTick()), not
-// loop() - see README for why. Must never block: always passes
-// allowBlockingRead=false, and deliberately doesn't handle "song finished"
-// (see checkTrackFinished(), main-loop-only since it blocks on disk I/O).
+// Runs from the dispatch timer interrupt - must never block, so always
+// passes allowBlockingRead=false and never handles "song finished" (that's
+// checkTrackFinished(), main-loop-only since it blocks on disk I/O).
 void updateMidiDispatch() {
   if (!playing || !midiSeqValid) return;
   uint32_t songTimeUs = currentSongTimeUs();
   MidiEvent e;
-  // Retry even if nothing is pending - midi_seq_advance() is the only thing
-  // that re-primes a stalled track, and the loop below only calls it once
-  // peek() is already true. Without this, a stall (as opposed to real
-  // completion) would never recover. Harmless if the song really is over.
+  // Retry even with nothing pending - this is the only thing that re-primes a stalled track.
   if (!midi_seq_peek(&midiSeq, &e)) {
     midi_seq_advance(&midiSeq, false);
   }
+  bool dispatchedAny = false;
   while (midi_seq_peek(&midiSeq, &e) && e.time_us <= songTimeUs) {
     if (e.channel != 9) { // GM percussion channel - no drum synthesis yet, so skip rather than mis-render as pitches
-      sendNoteCommand(e.type == MIDI_EVT_NOTE_ON, e.channel, e.note, e.velocity);
+      sendNoteCommand(e.type == MIDI_EVT_NOTE_ON, e.channel, e.note, e.velocity, e.program);
+      dispatchedAny = true;
     }
     midi_seq_advance(&midiSeq, false);
   }
+  // Hoisted out of sendNoteCommand() - millis()/volatile write once per
+  // tick instead of once per note, harmless since the watchdog only cares
+  // about elapsed time at a 3-second granularity.
+  if (dispatchedAny) lastNoteCommandMs = millis();
 }
 
 // midi_seq_all_tracks_finished() (not midi_seq_peek()) is the only
@@ -519,10 +539,8 @@ void checkDispatchWatchdog() {
   midi_seq_debug_dump(&midiSeq);
 }
 
-// Fades out current notes as soon as a genuine buffer-starvation stall is
-// detected (buffer-state-driven, not a wall-clock guess - see
-// midi_seq_any_track_stalled(), which can't false-positive on an ordinary
-// long note/rest), so a stall is silent rather than a droning held note.
+// Mutes as soon as a genuine buffer-starvation stall is detected (see
+// midi_seq_any_track_stalled()), so a stall is silent, not a droning note.
 const uint32_t STALL_MUTE_MS = 500;
 static bool mutedForStall = false;
 
@@ -534,6 +552,23 @@ void checkStallMute() {
     sendAllNotesOff();
   } else if (!stalled) {
     mutedForStall = false;
+  }
+}
+
+// Freezes the song clock the instant any track stalls, well before
+// STALL_MUTE_MS - otherwise wall-clock time keeps accruing during a brief
+// disk hiccup, and once it resolves, every now-overdue event dispatches in
+// one rapid burst (an audible "speedup" right after the lag), even for
+// stalls far too short to ever trigger the mute or watchdog.
+void checkStallClock() {
+  if (!playing || !midiSeqValid) { clockPausedForStall = false; return; }
+  bool stalled = midi_seq_any_track_stalled(&midiSeq, CLOCK_STALL_THRESHOLD_MS);
+  if (stalled && !clockPausedForStall) {
+    clockPausedForStall = true;
+    stallPauseStartUs = micros();
+  } else if (!stalled && clockPausedForStall) {
+    clockPausedForStall = false;
+    playSegmentStartUs += micros() - stallPauseStartUs; // erase the paused span from the clock baseline
   }
 }
 
@@ -681,6 +716,7 @@ void loop() {
   checkDiskChange();
   checkEmptyPlaylist();
   if (midiSeqValid) midi_seq_maintain(&midiSeq);
+  if (midiSeqValid) checkStallClock();
   if (midiSeqValid) checkStallMute();
   checkTrackFinished();
   checkDispatchWatchdog();

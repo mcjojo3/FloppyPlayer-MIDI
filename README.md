@@ -82,7 +82,7 @@ The volume pot, if wired, gives continuous control and simply overrides the last
 
 Arduino IDE with the [arduino-pico](https://github.com/earlephilhower/arduino-pico) core installed. Board: **Waveshare RP2040 PiZero** (`rp2040:rp2040:waveshare_rp2040_pizero`). Uses the core's bundled `PWMAudio` library for audio output - no other external libraries required.
 
-**Requires Tools -> CPU Speed -> 200MHz** (this is already the default for the `waveshare_rp2040_pizero` board definition, but worth double-checking if it's ever changed). The synth's per-sample envelope math needs this headroom - at a lower clock, dense chords can overrun the audio budget and freeze the board solid.
+**Requires Tools -> CPU Speed -> 250MHz (Overclock)** (the board defaults to 200MHz - this must be set manually and is easy to lose track of, since it's an IDE project setting, not something in source). The synth's per-sample envelope math needs this headroom - at a lower clock, dense chords can overrun the audio budget and freeze the board solid. `MAX_VOICES` (`synth.cpp`) was raised from 16 to 24 for pieces with heavier polyphony, which is why the clock was raised past the previous 200MHz baseline.
 
 ## License
 
