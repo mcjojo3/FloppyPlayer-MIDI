@@ -86,4 +86,4 @@ Arduino IDE with the [arduino-pico](https://github.com/earlephilhower/arduino-pi
 
 ## License
 
-MIT - see [LICENSE](LICENSE). The PIO flux-capture core is a port of the approach used in [adafruit/Adafruit_Floppy](https://github.com/adafruit/Adafruit_Floppy) (also MIT-licensed).
+MIT - see [LICENSE](LICENSE). The PIO flux-capture core is a port of the approach used in [adafruit/Adafruit_Floppy](https://github.com/adafruit/Adafruit_Floppy).
