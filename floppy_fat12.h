@@ -7,6 +7,15 @@
 // cylinder 0. Call once at startup before floppy_mount().
 bool floppy_init();
 
+// Lets a long multi-attempt cylinder read bail out early if either button
+// pin reads pressed (raw digitalRead, not the debounced Button class - the
+// point is to react while still stuck inside a single blocking call, before
+// loop() ever gets to poll buttons normally). Checked only between retry
+// attempts, never mid-capture, so it can't corrupt anything: an aborted
+// cylinder just returns whatever sectors were already captured, the same
+// outcome as a genuinely marginal disk read. Pass -1 to disable either pin.
+void floppy_set_skip_pins(int pin1, int pin2);
+
 // Reads the boot sector, FAT, and root directory into RAM. Must succeed
 // before any other floppy_* call. Returns false on failure - check
 // floppy_last_error() for why.
@@ -64,6 +73,11 @@ FloppyError floppy_last_error();
 
 // Only meaningful right after floppy_last_error() == FLOPPY_ERR_SECTOR_UNRECOVERABLE.
 void floppy_last_sector_failure(int *cyl, int *head, int *sector);
+
+// Cumulative count of real seek+capture attempts (cache misses) since boot -
+// not cache hits. Useful as an on-screen activity/health indicator when
+// there's no Serial monitor hooked up.
+uint32_t floppy_read_count();
 
 // A file's on-disk layout, opened once per file and then used by
 // floppy_read_file_sector() to serve arbitrary out-of-order reads cheaply.

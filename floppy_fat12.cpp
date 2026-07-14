@@ -410,6 +410,7 @@ static void invalidateSectorCache() {
 
 static FloppyError g_lastError = FLOPPY_OK;
 static int g_lastFailCyl = -1, g_lastFailHead = -1, g_lastFailSector = -1;
+static uint32_t g_readCount = 0; // real seek+capture attempts (cache misses), not cache hits
 
 FloppyError floppy_last_error() { return g_lastError; }
 void floppy_last_sector_failure(int *cyl, int *head, int *sector) {
@@ -417,6 +418,7 @@ void floppy_last_sector_failure(int *cyl, int *head, int *sector) {
   *head = g_lastFailHead;
   *sector = g_lastFailSector;
 }
+uint32_t floppy_read_count() { return g_readCount; }
 
 static uint32_t lastTransitionCount;
 
@@ -539,6 +541,19 @@ static void __not_in_flash_func(decodeCurrentTrackIntoCache)(int slot, int cyl, 
 // Returns the cache slot holding cyl's data (loading it first if needed),
 // or -1 on failure. Picks an empty slot if one exists, else evicts the
 // least-recently-used one.
+static int skipPin1 = -1;
+static int skipPin2 = -1;
+
+void floppy_set_skip_pins(int pin1, int pin2) {
+  skipPin1 = pin1;
+  skipPin2 = pin2;
+}
+
+static inline bool skipRequested() {
+  return (skipPin1 >= 0 && digitalRead(skipPin1) == LOW) ||
+         (skipPin2 >= 0 && digitalRead(skipPin2) == LOW);
+}
+
 static int ensureCylinderCached(int cyl) {
   // A real disk only has NUM_CYLINDERS tracks - reject anything outside
   // that range immediately rather than seeking somewhere physically
@@ -569,6 +584,7 @@ static int ensureCylinderCached(int cyl) {
       if (slotLastUsed[s] < slotLastUsed[slot]) slot = s;
   }
 
+  g_readCount++; // a genuine cache miss - about to seek and capture for real
   seekToCylinder(cyl);
 
   // Reset once per cylinder, not per attempt - see decodeCurrentTrackIntoCache().
@@ -577,6 +593,7 @@ static int ensureCylinderCached(int cyl) {
       sectorPresent[slot][h][s] = false;
 
   for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0 && skipRequested()) break; // user wants to move on - don't burn more retries on this cylinder
 #if FLOPPY_VERBOSE_CAPTURE_LOG
     Serial.print("  cyl=");
     Serial.print(cyl);

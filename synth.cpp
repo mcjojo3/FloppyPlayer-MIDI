@@ -27,12 +27,15 @@ static Waveform waveformForProgram(uint8_t program) {
 struct Voice {
   bool active;
   bool releasing;
+  bool unison; // brass only - a second, slightly detuned oscillator adds section-like richness
   uint8_t channel;
   uint8_t note;
   Waveform waveform;
   uint32_t phaseStep; // fixed 32-bit phase increment per sample, from noteStepTable
+  uint32_t phaseStep2; // detuned second oscillator's step - only meaningful if unison
   float velocity;
   uint32_t phase;     // 32-bit phase accumulator - wraps naturally via unsigned overflow
+  uint32_t phase2;    // second oscillator's phase - only meaningful if unison
   uint32_t startTimeUs;
   uint32_t releaseTimeUs;
   float releaseStartLevel; // level_at() at the instant releasing began - constant for the whole release tail
@@ -57,6 +60,10 @@ static const float US_TO_SEC = 1.0f / 1000000.0f; // same reasoning - avoids a p
 static const float SAWTRI_GAIN = 1.2247f; // sqrt(3/2)
 static const float PULSE_GAIN = 0.7071f;  // 1/sqrt(2)
 
+// ~10 cents sharp for brass's second unison oscillator - thickens the tone
+// as the two slowly drift in and out of phase, without sounding out of tune.
+static const float DETUNE_RATIO = 1.006f;
+
 #define SINE_TABLE_BITS 8
 #define SINE_TABLE_SIZE (1 << SINE_TABLE_BITS)
 static float sineTable[SINE_TABLE_SIZE];
@@ -77,6 +84,30 @@ void synth_init(uint32_t sampleRate) {
   invSqrtTable[0] = 0.0f; // unused (0 active voices means silence, never multiplied)
   for (int n = 1; n <= MAX_VOICES; n++) {
     invSqrtTable[n] = 1.0f / sqrtf((float)n);
+  }
+}
+
+static float __not_in_flash_func(computeWaveform)(Waveform wf, uint32_t phase) {
+  switch (wf) {
+    case WAVE_SAW:
+      // Scaled so RMS loudness matches the sine table, not just peak amplitude.
+      return SAWTRI_GAIN * (float)(int32_t)phase / 2147483648.0f;
+    case WAVE_TRIANGLE: {
+      float ramp = (float)(int32_t)phase / 2147483648.0f;
+      return SAWTRI_GAIN * (2.0f * fabsf(ramp) - 1.0f); // fold the ramp into a triangle
+    }
+    // Bipolar pulse (swings +-PULSE_GAIN regardless of duty cycle) - RMS
+    // equals peak amplitude here, so this one constant matches all three.
+    case WAVE_PULSE50:
+      return (phase < 0x80000000u) ? PULSE_GAIN : -PULSE_GAIN;
+    case WAVE_PULSE25:
+      return (phase < 0x40000000u) ? PULSE_GAIN : -PULSE_GAIN;
+    case WAVE_PULSE12:
+      return (phase < 0x20000000u) ? PULSE_GAIN : -PULSE_GAIN;
+    default: {
+      uint32_t tableIndex = phase >> (32 - SINE_TABLE_BITS);
+      return sineTable[tableIndex];
+    }
   }
 }
 
@@ -132,9 +163,12 @@ void synth_note_on(uint8_t channel, uint8_t note, uint8_t velocity, uint8_t prog
   voices[slot].channel = channel;
   voices[slot].note = note;
   voices[slot].waveform = waveformForProgram(program);
+  voices[slot].unison = (program >= 56 && program <= 63); // brass - ZUN uses it heavily, worth the extra oscillator
   voices[slot].phaseStep = noteStepTable[note & 0x7F];
+  voices[slot].phaseStep2 = voices[slot].unison ? (uint32_t)(voices[slot].phaseStep * DETUNE_RATIO) : 0;
   voices[slot].velocity = velocity / 127.0f;
   voices[slot].phase = 0;
+  voices[slot].phase2 = 0;
   voices[slot].startTimeUs = nowUs;
   voices[slot].active = true;
 }
@@ -180,36 +214,16 @@ float __not_in_flash_func(synth_sample)(uint32_t nowUs) {
     float env = envelope(voices[i], nowUs);
     if (!voices[i].active) continue; // envelope() may have just deactivated it
 
-    float osc;
-    switch (voices[i].waveform) {
-      case WAVE_SAW:
-        // Scaled so RMS loudness matches the sine table, not just peak amplitude.
-        osc = SAWTRI_GAIN * (float)(int32_t)voices[i].phase / 2147483648.0f;
-        break;
-      case WAVE_TRIANGLE: {
-        float ramp = (float)(int32_t)voices[i].phase / 2147483648.0f;
-        osc = SAWTRI_GAIN * (2.0f * fabsf(ramp) - 1.0f); // fold the ramp into a triangle
-        break;
-      }
-      // Bipolar pulse (swings +-PULSE_GAIN regardless of duty cycle) - RMS
-      // equals peak amplitude here, so this one constant matches all three.
-      case WAVE_PULSE50:
-        osc = (voices[i].phase < 0x80000000u) ? PULSE_GAIN : -PULSE_GAIN;
-        break;
-      case WAVE_PULSE25:
-        osc = (voices[i].phase < 0x40000000u) ? PULSE_GAIN : -PULSE_GAIN;
-        break;
-      case WAVE_PULSE12:
-        osc = (voices[i].phase < 0x20000000u) ? PULSE_GAIN : -PULSE_GAIN;
-        break;
-      default: {
-        uint32_t tableIndex = voices[i].phase >> (32 - SINE_TABLE_BITS);
-        osc = sineTable[tableIndex];
-        break;
-      }
-    }
-    float s = osc * env * voices[i].velocity;
+    float osc = computeWaveform(voices[i].waveform, voices[i].phase);
     voices[i].phase += voices[i].phaseStep; // wraps naturally, no branch needed
+
+    if (voices[i].unison) {
+      float osc2 = computeWaveform(voices[i].waveform, voices[i].phase2);
+      voices[i].phase2 += voices[i].phaseStep2;
+      osc = 0.5f * (osc + osc2); // average, not sum - keeps peak amplitude in check while still thickening
+    }
+
+    float s = osc * env * voices[i].velocity;
 
     sum += s;
     activeCount++;

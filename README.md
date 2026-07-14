@@ -23,8 +23,8 @@ A standalone MIDI player that reads and plays `.MID` files directly off a real 3
 | Index | 10 | input, needs pull-up |
 | Read Data | 11 | input, needs pull-up |
 | Disk Change (DSKCHG, ribbon pin 34) | 27 | input, needs pull-up - **not physically wired in the reference build yet** |
-| Next track | 12 | button to GND, internal pull-up |
-| Prev track | 13 | button to GND, internal pull-up |
+| Next track | 12 | button to GND, internal pull-up - also polled directly (raw GPIO) inside a stuck disk-read retry so a press can interrupt it early |
+| Prev track | 13 | button to GND, internal pull-up - same early-interrupt behavior as Next |
 | Play/Pause | 14 | button to GND, internal pull-up |
 | Volume up | 15 | button to GND, internal pull-up |
 | Volume down | 17 | button to GND, internal pull-up |
@@ -33,6 +33,8 @@ A standalone MIDI player that reads and plays `.MID` files directly off a real 3
 | Volume pot wiper | 26 (ADC0) | B500K linear taper, 3.3V-to-GND divider |
 | Audio left | 22 | PWM out -> RC filter -> jack |
 | Audio right | 23 | PWM out -> RC filter -> jack |
+| OLED SDA | 24 | I2C0, 0.96" SSD1306 128x64 status/error display - optional |
+| OLED SCL | 25 | I2C0, address 0x3C |
 
 The three open-collector drive inputs (Track00, Index, Read Data, and Disk Change if wired) all need the same treatment: a 1kΩ pull-up to +5V, then a 10kΩ/20kΩ divider down to a safe 3.3V logic level before the GPIO, since these lines idle at 5V and the RP2040's GPIOs aren't 5V-tolerant.
 

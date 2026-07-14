@@ -7,6 +7,32 @@
 #include <pico/time.h>
 #include <string.h>
 #include <math.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// 0.96" I2C OLED (SSD1306, 128x64) for on-the-go status/error display when
+// no Serial monitor is hooked up. GPIO24/25 - only shared with the unused
+// DVI port, so no conflict with anything this firmware actually uses.
+#define OLED_SDA_PIN 24
+#define OLED_SCL_PIN 25
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+bool displayOk = false;
+
+void setupDisplay() {
+  Wire.setSDA(OLED_SDA_PIN);
+  Wire.setSCL(OLED_SCL_PIN);
+  Wire.begin();
+  displayOk = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  if (!displayOk) {
+    Serial.println("OLED init failed (check wiring/I2C address)");
+    return;
+  }
+  display.clearDisplay();
+  display.display();
+}
 
 const int PIN_NEXT       = 12;
 const int PIN_PREV       = 13;
@@ -206,6 +232,9 @@ const uint32_t CLOCK_STALL_THRESHOLD_MS = 20;
 static bool clockPausedForStall = false;
 static uint32_t stallPauseStartUs = 0;
 
+// See checkDispatchWatchdog() - cumulative since boot, shown on the OLED status line.
+uint32_t watchdogFireCount = 0;
+
 MidiSequencer midiSeq;
 // volatile: read every tick by the dispatch timer interrupt, written by
 // loop() (loadCurrentTrack) - guards the ISR from touching midiSeq mid-rewrite
@@ -219,30 +248,52 @@ uint32_t currentSongTimeUs() {
   return songElapsedBeforePauseUs;
 }
 
+// Short, screen-sized version of the same error - shown on the OLED
+// alongside the fuller Serial message below.
+void showDisplayError(const char *line1, const char *line2 = "") {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("ERROR");
+  display.println(line1);
+  display.println(line2);
+  display.display();
+}
+
 void printFloppyError() {
   switch (floppy_last_error()) {
     case FLOPPY_OK:
       Serial.println("  (no floppy error recorded - check the file's own format)");
+      showDisplayError("no error recorded", "check file format");
       break;
     case FLOPPY_ERR_NOT_MOUNTED:
       Serial.println("  error: disk not mounted");
+      showDisplayError("disk not mounted");
       break;
     case FLOPPY_ERR_BAD_BOOT_SECTOR:
       Serial.println("  error: boot sector unreadable, or not a recognizable FAT12 disk");
+      showDisplayError("bad boot sector", "not FAT12?");
       break;
     case FLOPPY_ERR_NO_CLUSTERS:
       Serial.println("  error: this file/folder has no data (empty or corrupt directory entry)");
+      showDisplayError("empty/corrupt", "directory entry");
       break;
     case FLOPPY_ERR_TOO_MANY_CLUSTERS:
       Serial.println("  error: file is larger than this firmware's cluster-chain limit (FLOPPY_MAX_FILE_CLUSTERS)");
+      showDisplayError("file too large", "(cluster limit)");
       break;
     case FLOPPY_ERR_SECTOR_UNRECOVERABLE: {
       int cyl, head, sector;
       floppy_last_sector_failure(&cyl, &head, &sector);
+      char line1[22], line2[22];
       if (head == -1) {
         Serial.print("  error: requested cylinder ");
         Serial.print(cyl);
         Serial.println(" is out of range for this disk - likely a corrupted cluster/LBA value upstream");
+        snprintf(line1, sizeof(line1), "cyl %d out of range", cyl);
+        line2[0] = '\0';
       } else {
         Serial.print("  error: unrecoverable sector at cylinder=");
         Serial.print(cyl);
@@ -250,11 +301,15 @@ void printFloppyError() {
         Serial.print(head);
         Serial.print(" sector=");
         Serial.println(sector);
+        snprintf(line1, sizeof(line1), "bad sector c%d h%d", cyl, head);
+        snprintf(line2, sizeof(line2), "s%d", sector);
       }
+      showDisplayError(line1, line2);
       break;
     }
     case FLOPPY_ERR_OUT_OF_RANGE:
       Serial.println("  error: read past the end of the file (corrupt size or cluster chain?)");
+      showDisplayError("read past EOF", "(corrupt chain?)");
       break;
   }
 }
@@ -272,6 +327,19 @@ void loadCurrentTrack() {
   Serial.print(" (");
   Serial.print(entry.size);
   Serial.println(" bytes)...");
+
+  if (displayOk) {
+    // Shown only while this blocking mount runs - whichever printState() call
+    // the caller makes once loadCurrentTrack() returns repaints normal status.
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Reading disk...");
+    display.print(entry.name);
+    if (entry.ext[0]) { display.print("."); display.print(entry.ext); }
+    display.display();
+  }
 
   unsigned long start = millis();
   if (!midi_seq_init(&midiSeq, entry)) {
@@ -342,6 +410,25 @@ void printState() {
   Serial.print(playing ? "YES" : "NO");
   Serial.print(" Volume=");
   Serial.println(volume);
+
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print(numFolders > 0 ? folders[currentFolder].name : "(none)");
+  display.print(" ");
+  display.print(currentTrack + 1);
+  display.print("/");
+  display.println(numFolders > 0 ? folders[currentFolder].trackCount : 0);
+  display.println(playing ? "Playing" : "Paused");
+  display.print("Vol ");
+  display.println(volume);
+  display.print("Reads ");
+  display.print(floppy_read_count());
+  display.print(" WD ");
+  display.println(watchdogFireCount);
+  display.display();
 }
 
 void nextTrack() {
@@ -531,6 +618,7 @@ void checkDispatchWatchdog() {
   if (millis() - lastNoteCommandMs < DISPATCH_STALL_TIMEOUT_MS) { dumpedForThisStall = false; return; }
   if (dumpedForThisStall) return;
   dumpedForThisStall = true;
+  watchdogFireCount++;
   Serial.print("WATCHDOG: no note dispatched for ");
   Serial.print(DISPATCH_STALL_TIMEOUT_MS);
   Serial.print("ms while playing (songTimeUs=");
@@ -655,12 +743,14 @@ static bool midiDispatchTick(repeating_timer_t *) {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  setupDisplay();
 
   btnNext.begin(PIN_NEXT);
   btnPrev.begin(PIN_PREV);
   btnPlayPause.begin(PIN_PLAYPAUSE);
   btnVolUp.begin(PIN_VOLUP);
   btnVolDown.begin(PIN_VOLDOWN);
+  floppy_set_skip_pins(PIN_NEXT, PIN_PREV); // let a stuck cylinder retry bail out early on a track-change press
   pinMode(PIN_LOOP_SWITCH, INPUT_PULLUP);
   pinMode(PIN_AUTOPLAY_SWITCH, INPUT_PULLUP);
   buildVolumeTable();
