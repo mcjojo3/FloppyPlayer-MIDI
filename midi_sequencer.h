@@ -106,3 +106,13 @@ void midi_seq_maintain(MidiSequencer *seq);
 // least minMs - a genuine buffer-starvation stall, never a false positive
 // from an ordinary long note/rest. Meant for a caller to mute proactively.
 bool midi_seq_any_track_stalled(MidiSequencer *seq, uint32_t minMs);
+
+// Cumulative count of tracks skipped via midi_seq_maintain()'s give-up path
+// (stuck retrying the same position too long) since boot.
+uint32_t midi_seq_give_up_count();
+
+// Controls whether midi_seq_maintain() ever gives up on a stuck track.
+// Defaults to true (matches the give-up-and-skip behavior that was
+// previously unconditional). When false, a stuck track is retried forever
+// instead of being marked finished - the on-screen "Skip Bad Tracks" setting.
+void midi_seq_set_skip_bad_tracks(bool enabled);

@@ -1,4 +1,5 @@
 // midi_sequencer.cpp - see midi_sequencer.h.
+#include "config.h"
 #include "midi_sequencer.h"
 #include <Arduino.h>
 #include <string.h>
@@ -8,6 +9,12 @@ static const uint8_t MIDI_EVT_OTHER_INTERNAL = 2;
 static const uint8_t MIDI_EVT_CC_INTERNAL = 201; // channel in pendingChannel, controller# in pendingA, value in pendingB
 static const uint8_t MIDI_EVT_TEMPO_INTERNAL = 200;
 static const uint8_t MIDI_EVT_PROGRAM_INTERNAL = 202; // channel in pendingChannel, program# in pendingA
+
+static uint32_t g_giveUpCount = 0; // cumulative tracks skipped via midi_seq_maintain()'s give-up path
+uint32_t midi_seq_give_up_count() { return g_giveUpCount; }
+
+static bool g_skipBadTracks = true;
+void midi_seq_set_skip_bad_tracks(bool enabled) { g_skipBadTracks = enabled; }
 
 // Loads up to MIDI_SEQ_HALF_WINDOW_BYTES starting at the sector containing
 // requestedStart (window starts are always sector-aligned).
@@ -451,11 +458,7 @@ void midi_seq_debug_dump(MidiSequencer *seq) {
   }
 }
 
-// 8s of no progress is roughly 4-8 real capture attempts (each already
-// costs up to ~1-2s) - long enough to ride out a slow/fragmented read,
-// short enough that a genuinely unrecoverable sector doesn't hang playback
-// indefinitely.
-static const uint32_t MIDI_SEQ_MAINTAIN_GIVE_UP_MS = 8000;
+// See config.h (MIDI_SEQ_MAINTAIN_GIVE_UP_MS) for the reasoning.
 
 void midi_seq_maintain(MidiSequencer *seq) {
   for (int i = 0; i < seq->trackCount; i++) {
@@ -481,7 +484,7 @@ void midi_seq_maintain(MidiSequencer *seq) {
     if (tc.stallWatchPos != tc.pos) {
       tc.stallWatchPos = tc.pos;
       tc.stallStartMs = millis();
-    } else if (tc.stallStartMs != 0 && millis() - tc.stallStartMs > MIDI_SEQ_MAINTAIN_GIVE_UP_MS) {
+    } else if (g_skipBadTracks && tc.stallStartMs != 0 && millis() - tc.stallStartMs > MIDI_SEQ_MAINTAIN_GIVE_UP_MS) {
       Serial.print("midi_seq_maintain: giving up on track stuck at pos=");
       Serial.print(tc.pos);
       Serial.print(" after ");
@@ -498,6 +501,7 @@ void midi_seq_maintain(MidiSequencer *seq) {
         Serial.print(" sector=");
         Serial.println(sector);
       }
+      g_giveUpCount++;
       tc.finished = true;
       continue;
     }

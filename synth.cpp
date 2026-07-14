@@ -1,10 +1,9 @@
 // synth.cpp - see synth.h.
+#include "config.h"
 #include "synth.h"
 #include <math.h>
 #include <Arduino.h>
 #include <pico/platform.h>
-
-const int MAX_VOICES = 24;
 
 // Coarse GM program -> waveform grouping (not a real per-instrument model,
 // and not aiming for clean/anti-aliased either - deliberately leaning into
@@ -43,10 +42,7 @@ struct Voice {
 
 static Voice voices[MAX_VOICES];
 
-static const float ATTACK = 0.01f;
-static const float DECAY = 0.1f;
-static const float SUSTAIN = 0.7f;
-static const float RELEASE = 0.15f;
+// ADSR values (ATTACK/DECAY/SUSTAIN/RELEASE) come from config.h.
 // Reciprocals precomputed once so per-sample envelope math multiplies
 // instead of divides - division is the slowest basic float op without a hardware FPU.
 static const float ATTACK_INV = 1.0f / ATTACK;
@@ -60,9 +56,7 @@ static const float US_TO_SEC = 1.0f / 1000000.0f; // same reasoning - avoids a p
 static const float SAWTRI_GAIN = 1.2247f; // sqrt(3/2)
 static const float PULSE_GAIN = 0.7071f;  // 1/sqrt(2)
 
-// ~10 cents sharp for brass's second unison oscillator - thickens the tone
-// as the two slowly drift in and out of phase, without sounding out of tune.
-static const float DETUNE_RATIO = 1.006f;
+// DETUNE_RATIO (brass unison detune) comes from config.h.
 
 #define SINE_TABLE_BITS 8
 #define SINE_TABLE_SIZE (1 << SINE_TABLE_BITS)

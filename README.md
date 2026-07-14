@@ -2,13 +2,15 @@
 
 A standalone MIDI player that reads and plays `.MID` files directly off a real 3.5" floppy disk - no PC involved. An RP2040 reads the raw magnetic flux off the disk, decodes it into a FAT12 filesystem in firmware, parses the MIDI files it finds, and drives a small polyphonic synth out to a headphone jack.
 
+Every pin assignment and behavior tuning knob (retry patience, timeouts, voice count, volume floor, etc.) lives in **[`config.h`](config.h)** - that's the file to edit for a different pinout or to retune behavior, rather than hunting through each source file.
+
 ## Hardware
 
 - RP2040 board: **Waveshare RP2040-PiZero** (40-pin Raspberry Pi Zero-compatible header)
 - A real 3.5" floppy drive (high-density, 1.44MB) with its 34-pin ribbon cable
 - Floppy drive power: 5V works on its own in testing, though a real drive's spec calls for both 5V (logic) and 12V (spindle/stepper motor) - provide both if possible
 - Audio out: PWM + RC low-pass filter per channel into a standard headphone/aux jack (no DAC chip)
-- 5 momentary buttons (Next/Prev/Play-Pause/Vol+/Vol-), 2 optional toggle switches (loop mode, autoplay), 1 optional potentiometer (volume)
+- 6 momentary buttons (Next/Prev/Play-Pause/Vol+/Vol-/Screen), 1 optional potentiometer (volume) - Loop/Autoplay/Shuffle/Skip Bad Tracks/Dim Screen are on-screen config settings now (see Controls below), not physical switches
 
 ### Wiring
 
@@ -22,21 +24,20 @@ A standalone MIDI player that reads and plays `.MID` files directly off a real 3
 | Track00 | 9 | input, needs pull-up (see below) |
 | Index | 10 | input, needs pull-up |
 | Read Data | 11 | input, needs pull-up |
-| Disk Change (DSKCHG, ribbon pin 34) | 27 | input, needs pull-up - **not physically wired in the reference build yet** |
+| Disk Change (DSKCHG, ribbon pin 34) | 27 | input - **not physically wired in the reference build yet**, so firmware enables the internal pull-up as a stopgap (an unwired floating pin was misread as spurious disk-change events, resetting playback to track 1); switch to a real external pull-up once this is wired |
 | Next track | 12 | button to GND, internal pull-up - also polled directly (raw GPIO) inside a stuck disk-read retry so a press can interrupt it early |
 | Prev track | 13 | button to GND, internal pull-up - same early-interrupt behavior as Next |
 | Play/Pause | 14 | button to GND, internal pull-up |
 | Volume up | 15 | button to GND, internal pull-up |
 | Volume down | 17 | button to GND, internal pull-up |
-| Loop-mode switch | 16 | grounded = repeat current track instead of auto-advance |
-| Autoplay switch | 2 | grounded = start playing automatically after any disk scan |
 | Volume pot wiper | 26 (ADC0) | B500K linear taper, 3.3V-to-GND divider |
 | Audio left | 22 | PWM out -> RC filter -> jack |
 | Audio right | 23 | PWM out -> RC filter -> jack |
 | OLED SDA | 24 | I2C0, 0.96" SSD1306 128x64 status/error display - optional |
 | OLED SCL | 25 | I2C0, address 0x3C |
+| Screen button | 6 | button to GND, internal pull-up - swaps the OLED between the user and technical screens |
 
-The three open-collector drive inputs (Track00, Index, Read Data, and Disk Change if wired) all need the same treatment: a 1kΩ pull-up to +5V, then a 10kΩ/20kΩ divider down to a safe 3.3V logic level before the GPIO, since these lines idle at 5V and the RP2040's GPIOs aren't 5V-tolerant.
+The four open-collector drive inputs (Track00, Index, Read Data, and Disk Change if wired) all need the same treatment: a 1kΩ pull-up to +5V, then a 10kΩ/20kΩ divider down to a safe 3.3V logic level before the GPIO, since these lines idle at 5V and the RP2040's GPIOs aren't 5V-tolerant.
 
 GPIO2/3/16/22-29 are reclaimed from this board's unused DVI/HDMI header - safe to repurpose as long as nothing is ever plugged into that port. **Not every one of those pins is actually broken out to the 40-pin header** - GPIO28/29 turned out to be wired only to the DVI clock differential pair with no header connection at all, so don't assume a pin is free without checking the board's actual schematic or silkscreen first.
 
@@ -53,8 +54,11 @@ GPIO2/3/16/22-29 are reclaimed from this board's unused DVI/HDMI header - safe t
 | Play/Pause | Toggle play/pause | - |
 | Vol+ | Volume up (11 discrete steps) | - |
 | Vol- | Volume down | - |
+| Screen | Swap OLED between user/technical view | Enter/exit config menu |
 
 The volume pot, if wired, gives continuous control and simply overrides the last button-set level whenever it's turned. Connect Serial Monitor at **115200 baud** to see track-load, error, and diagnostic messages (folder/track state, why a mount failed, why a track was skipped, etc).
+
+**Config menu** (OLED required): long-press Screen to enter (this also pauses playback for the duration, resuming right where it left off on exit). Prev/Next move the selection, Play/Pause toggles it (Loop/Autoplay/Shuffle/Skip Bad Tracks/Dim Screen, plus Exit at the bottom). Loop/Autoplay/Shuffle were previously dedicated grounded switches on GPIO16/2/3; Skip Bad Tracks (on by default) controls whether a track stuck on a bad sector eventually gets given up on and skipped, or retried forever - and always wins over Loop, so a bad track never loops on itself even with Loop enabled. Dim Screen lowers OLED contrast. All five persist in flash-emulated EEPROM, written once when you exit the menu (not per-toggle) - saving is a blocking flash write that briefly mutes audio, so batching it to once per visit keeps that to a minimum regardless of how many settings you change. The user screen no longer shows Loop/Autoplay/Shuffle status directly - check the config menu for that.
 
 ## Getting started / disk requirements
 
@@ -64,7 +68,7 @@ The volume pot, if wired, gives continuous control and simply overrides the last
 - **File size limit: ~1.1MB** per file (`FLOPPY_MAX_FILE_CLUSTERS`, sized for this disk's 512B/cluster format) - generous versus any real SMF file, but a hard ceiling
 - **Track count limit: 24** per MIDI file (`MIDI_SEQ_MAX_TRACKS`) - covers every multi-track (SMF format 1) file seen in testing (up to 18 tracks) with headroom
 - Channel 10 (MIDI channel index 9), the General MIDI percussion channel, is silenced rather than mis-rendered as pitched notes - there's no drum synthesis yet
-- A single bad/marginal sector on the disk doesn't stop playback: the player retries, and if a specific spot genuinely won't read after several seconds, it skips that track automatically rather than hanging
+- A single bad/marginal sector on the disk doesn't stop playback: the player retries, and if a specific spot genuinely won't read after several seconds, it skips that track automatically rather than hanging (the Skip Bad Tracks config menu setting, on by default - turn it off to retry forever instead)
 
 ## Architecture
 
@@ -84,7 +88,7 @@ The volume pot, if wired, gives continuous control and simply overrides the last
 
 Arduino IDE with the [arduino-pico](https://github.com/earlephilhower/arduino-pico) core installed. Board: **Waveshare RP2040 PiZero** (`rp2040:rp2040:waveshare_rp2040_pizero`). Uses the core's bundled `PWMAudio` library for audio output - no other external libraries required.
 
-**Requires Tools -> CPU Speed -> 250MHz (Overclock)** (the board defaults to 200MHz - this must be set manually and is easy to lose track of, since it's an IDE project setting, not something in source). The synth's per-sample envelope math needs this headroom - at a lower clock, dense chords can overrun the audio budget and freeze the board solid. `MAX_VOICES` (`synth.cpp`) was raised from 16 to 24 for pieces with heavier polyphony, which is why the clock was raised past the previous 200MHz baseline.
+**Requires Tools -> CPU Speed -> 250MHz (Overclock)** (the board defaults to 200MHz - this must be set manually and is easy to lose track of, since it's an IDE project setting, not something in source). The synth's per-sample envelope math needs this headroom - at a lower clock, dense chords can overrun the audio budget and freeze the board solid. `MAX_VOICES` (`config.h`) was raised from 16 to 24 for pieces with heavier polyphony, which is why the clock was raised past the previous 200MHz baseline.
 
 ## License
 

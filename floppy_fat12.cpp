@@ -1,6 +1,7 @@
 // floppy_fat12.cpp - see floppy_fat12.h and README.md for the design
 // overview. PIO capture core (pins, program, clock derivation) targets this
 // exact hardware's flux timing.
+#include "config.h"
 #include "floppy_fat12.h"
 #include <Arduino.h>
 #include <hardware/clocks.h>
@@ -396,16 +397,22 @@ static bool __not_in_flash_func(decodeDamPayload)(uint8_t mark, uint32_t dataSta
 static const int SECTORS_PER_TRACK = 18;
 static const int NUM_HEADS = 2;
 
-#define NUM_CACHE_SLOTS 3
 static uint8_t sectorCache[NUM_CACHE_SLOTS][NUM_HEADS][SECTORS_PER_TRACK][512];
 static bool sectorPresent[NUM_CACHE_SLOTS][NUM_HEADS][SECTORS_PER_TRACK];
 static int cachedCyl[NUM_CACHE_SLOTS];
 static uint32_t slotLastUsed[NUM_CACHE_SLOTS];
 static uint32_t cacheUseCounter;
 
+// Consecutive invalidate-and-refetch cycles per cylinder (see readSector())
+// - caps how many times a single marginal cylinder can force a full fresh
+// 3-attempt recapture before we just accept whatever it gave us, rather
+// than truly forever. See config.h (MAX_CYLINDER_REFETCH_STREAK).
+static uint8_t cylinderMissStreak[NUM_CYLINDERS];
+
 static void invalidateSectorCache() {
   for (int s = 0; s < NUM_CACHE_SLOTS; s++) { cachedCyl[s] = -1; slotLastUsed[s] = 0; }
   cacheUseCounter = 0;
+  for (int c = 0; c < NUM_CYLINDERS; c++) cylinderMissStreak[c] = 0;
 }
 
 static FloppyError g_lastError = FLOPPY_OK;
@@ -435,7 +442,6 @@ static bool __not_in_flash_func(captureOneRevolutionToCellbits)() {
   pio_sm_restart(capturePio, captureSm);
   fifoHalfValid = false;
 
-  static const uint32_t INDEX_WAIT_TIMEOUT_MS = 1000;
   uint32_t waitStart = millis();
   while (gpio_get(pinIndex) == 0) { // wait for idle-high
     if (millis() - waitStart > INDEX_WAIT_TIMEOUT_MS) return false;
@@ -483,7 +489,7 @@ static bool __not_in_flash_func(captureOneRevolutionToCellbits)() {
 // inside this hot path caused real audio glitches (host-dependent blocking,
 // and Print isn't RAM-resident like the rest of this file). Flip to 1 to
 // debug a mount/recovery problem.
-#define FLOPPY_VERBOSE_CAPTURE_LOG 0
+#define FLOPPY_VERBOSE_CAPTURE_LOG 1 // TEMP: diagnosing repeated full-retry cylinder reads - flip back to 0 after
 static int diagIdamCrcOk, diagDamFound, diagDamCrcOk;
 
 // Does NOT reset sectorPresent[slot][head][*] at the start - see
@@ -593,7 +599,7 @@ static int ensureCylinderCached(int cyl) {
       sectorPresent[slot][h][s] = false;
 
   for (int attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0 && skipRequested()) break; // user wants to move on - don't burn more retries on this cylinder
+    if (attempt > 0 && skipRequested()) break; // don't burn more retries on this cylinder
 #if FLOPPY_VERBOSE_CAPTURE_LOG
     Serial.print("  cyl=");
     Serial.print(cyl);
@@ -641,20 +647,27 @@ static bool readSector(int cyl, int head, int sector, uint8_t *out512) {
   int slot = ensureCylinderCached(cyl);
   if (slot == -1) return false;
   if (!sectorPresent[slot][head][sector - 1]) {
-    // A cylinder stays marked cached even if some sectors never came back
-    // CRC-valid (otherwise one marginal sector would make the whole
-    // cylinder retry forever). But that means this specific miss would
-    // otherwise be permanent - the cache slot's cachedCyl staying set skips
-    // capture entirely on every future request. Invalidate so the next
-    // call gets a genuinely fresh capture; a marginal sector can succeed on
-    // a different revolution.
-    cachedCyl[slot] = -1;
     g_lastError = FLOPPY_ERR_SECTOR_UNRECOVERABLE;
     g_lastFailCyl = cyl;
     g_lastFailHead = head;
     g_lastFailSector = sector;
+    // A cylinder stays marked cached even if some sectors never came back
+    // CRC-valid (otherwise one marginal sector would make the whole
+    // cylinder retry forever). That means this specific miss would
+    // otherwise be permanent unless we invalidate so the next call gets a
+    // genuinely fresh capture - a marginal sector can succeed on a
+    // different revolution. But cap how many times we'll do that per
+    // cylinder: a cylinder that's consistently borderline (never quite
+    // clean, not transiently bad) can otherwise retry forever - real
+    // hardware logs showed one refetched 5 times in a row, ~2.5s each.
+    // Past the cap, accept the best capture we have and stop retrying.
+    if (cyl >= 0 && cyl < NUM_CYLINDERS && cylinderMissStreak[cyl] < MAX_CYLINDER_REFETCH_STREAK) {
+      cylinderMissStreak[cyl]++;
+      cachedCyl[slot] = -1;
+    }
     return false;
   }
+  if (cyl >= 0 && cyl < NUM_CYLINDERS) cylinderMissStreak[cyl] = 0; // this cylinder is behaving now
   memcpy(out512, sectorCache[slot][head][sector - 1], 512);
   return true;
 }
@@ -760,7 +773,14 @@ bool floppy_init() {
   pinMode(pinTrack00, INPUT);
   pinMode(pinIndex, INPUT);
   pinMode(pinReadData, INPUT);
-  pinMode(pinDiskChange, INPUT);
+  // INPUT_PULLUP, not plain INPUT like the other three above: this pin isn't
+  // physically wired yet (see README), so without a defined idle state it
+  // floats and picks up noise (this drive's stepper motor is a known noise
+  // source elsewhere in this project) - any spurious LOW reads as "disk
+  // changed" and force-resets playback to track 1 regardless of Loop/Shuffle.
+  // The internal pull-up won't conflict with the real external pull-up this
+  // pin is meant to eventually get; that will simply dominate once wired.
+  pinMode(pinDiskChange, INPUT_PULLUP);
 
   digitalWrite(pinDriveSelect, HIGH);
   digitalWrite(pinMotorEnable, HIGH);
