@@ -1,0 +1,7 @@
+# Installed by system/install.sh, after the apt packages fluidsynth and python3-pygame.
+
+mido>=1.3          # MIDI parsing, pure Python
+pyserial>=3.5      # RP2040 link transport
+pyfluidsynth>=1.3  # bindings for libfluidsynth
+pygame>=2.1        # touchscreen UI and MP3/OGG/FLAC/WAV playback
+mutagen>=1.45      # audio durations, tags and cover art

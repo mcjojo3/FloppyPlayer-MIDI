@@ -1,6 +1,5 @@
-// floppy_fat12.cpp - see floppy_fat12.h and README.md for the design
-// overview. PIO capture core (pins, program, clock derivation) targets this
-// exact hardware's flux timing.
+// floppy_fat12.cpp - see floppy_fat12.h. __not_in_flash_func() keeps the
+// capture/decode hot path in RAM, so it never waits on flash.
 #include "config.h"
 #include "floppy_fat12.h"
 #include <Arduino.h>
@@ -9,14 +8,6 @@
 #include <hardware/pio.h>
 #include <pico/platform.h>
 #include <string.h>
-
-// __not_in_flash_func() places a function's code in RAM instead of flash.
-// RP2040's two cores share one flash (XIP) bus; a long, tight, flash-executed
-// loop on one core stalls the other core's instruction fetches whenever both
-// need the bus at once. The per-revolution capture loop and its immediate
-// decode pass run flat-out for most of a cylinder read's real time, all on
-// Core 0, while Core 1 needs the flash bus too to keep the audio DMA buffer
-// fed - so the whole hot capture/decode path below is marked RAM-resident.
 
 const int pinDriveSelect = 0;
 const int pinMotorEnable = 1;
@@ -92,7 +83,8 @@ static void stepOnce(bool outward) {
   delay(6);
 }
 
-static void homeToTrack0() {
+// True if Track00 actually went low within the step budget.
+static bool homeToTrack0() {
   digitalWrite(pinDirection, HIGH);
   delayMicroseconds(10);
   int steps = 0;
@@ -100,6 +92,7 @@ static void homeToTrack0() {
     stepOnce(true);
     steps++;
   }
+  return digitalRead(pinTrack00) == LOW;
 }
 
 // HIGH = head 0, LOW = head 1 (inverted relative to the signal name).
@@ -110,8 +103,18 @@ static void selectHead(int head) {
 
 static int currentCyl = 0;
 
+// Diagnostics on DBG_SERIAL; marginal disks trigger them constantly.
+#define FLOPPY_DIAGNOSTIC_LOG 0
+
 static void seekToCylinder(int target) {
   if (target == currentCyl) return;
+#if FLOPPY_DIAGNOSTIC_LOG
+  // A back-and-forth pattern here is the file's own fragmentation.
+  DBG_SERIAL.print("floppy: seek ");
+  DBG_SERIAL.print(currentCyl);
+  DBG_SERIAL.print(" -> ");
+  DBG_SERIAL.println(target);
+#endif
   if (target > currentCyl) {
     for (int i = 0; i < target - currentCyl; i++) stepOnce(false); // inward = higher cylinder
   } else {
@@ -120,12 +123,7 @@ static void seekToCylinder(int target) {
   currentCyl = target;
 }
 
-// ============================================================================
-// Streaming MFM cell-bit decode: delta-to-unit conversion and cell-bit
-// packing fused into one pass as each transition arrives from the PIO FIFO,
-// instead of buffering raw deltas separately - the raw-deltas array alone
-// wouldn't fit in RAM alongside everything else.
-// ============================================================================
+// -- MFM decode, streamed as transitions arrive (raw deltas wouldn't fit in RAM) --
 
 #define MAX_CELLBITS 300000u // headroom above one revolution's worth of cell-bits
 static uint8_t cellBits[MAX_CELLBITS / 8];
@@ -151,24 +149,21 @@ static const int SYNC_TOLERANCE = 3;
 
 #define MAX_CANDIDATES 350 // headroom above one track's worth of sync-mark candidates
 static uint32_t candidatePositions[MAX_CANDIDATES];
+// Only one 0x4489 mark matched: the IDAM starts 16 cell-bits on, not 48.
+static bool candidateSinglePattern[MAX_CANDIDATES];
 static int candidateCount;
 
 static inline void __not_in_flash_func(emitBit)(int bit) {
   pushBit(bit);
 }
 
-// 48-bit Hamming distance via two 32-bit popcounts instead of one 64-bit
-// popcount - both inputs are always 48-bit-masked, so the 64-bit variant
-// would spend cycles on 16 bits that are provably always zero.
+// Two 32-bit popcounts: the inputs are 48-bit, so a 64-bit one wastes cycles.
 static inline int __not_in_flash_func(hammingDistance48)(uint64_t a, uint64_t b) {
   uint64_t x = a ^ b;
   return __builtin_popcount((uint32_t)x) + __builtin_popcount((uint32_t)(x >> 32));
 }
 
-// Sync-candidate search runs as a post-pass over the completed revolution,
-// not inline during capture - the timing-critical FIFO-draining loop can't
-// afford a software popcount (no hardware POPCNT) on every bit without
-// falling behind and corrupting samples.
+// A post-pass: the capture loop can't afford a software popcount per bit.
 static void __not_in_flash_func(findSyncCandidates)() {
   candidateCount = 0;
   uint64_t window = 0;
@@ -178,12 +173,14 @@ static void __not_in_flash_func(findSyncCandidates)() {
       uint64_t window48 = window & 0xFFFFFFFFFFFFULL;
       int mismatches = hammingDistance48(window48, SYNC_PATTERN_48);
       if (mismatches <= SYNC_TOLERANCE && candidateCount < MAX_CANDIDATES) {
+        candidateSinglePattern[candidateCount] = false;
         candidatePositions[candidateCount++] = pos + 1 - 48;
       }
     }
     if (pos + 1 >= 16) {
       uint64_t window16 = window & 0xFFFFULL;
       if (window16 == SINGLE_PATTERN_48 && candidateCount < MAX_CANDIDATES) {
+        candidateSinglePattern[candidateCount] = true;
         candidatePositions[candidateCount++] = pos + 1 - 16;
       }
     }
@@ -198,8 +195,7 @@ static inline void __not_in_flash_func(emitUnit)(int n) {
 
 static const int MAX_PLAUSIBLE_DELTA = 200;
 
-// Splits an interval >4 units into valid {2,3,4} parts (a bare 1-unit gap
-// isn't valid, so a trailing 1 folds into the previous 4 as a 2+3 split).
+// Splits a gap >4 units into valid 2/3/4 parts (a trailing 1 turns 4+1 into 2+3).
 static void __not_in_flash_func(decomposeAndEmit)(int delta) {
   if (delta > MAX_PLAUSIBLE_DELTA || delta <= 0) return; // skip silently
   int parts[64];
@@ -228,14 +224,11 @@ static inline void __not_in_flash_func(emitMergedUnit)(int unit) {
   else decomposeAndEmit(unit);
 }
 
-// A unit <2 gets added to the next unit before either is emitted; the tail
-// element (no partner to merge into) is flushed as-is via flushPendingUnit().
+// A unit <2 merges into the next one; flushPendingUnit() emits the tail.
 static bool havePendingUnit;
 static int pendingUnit;
 
-// raw/24.0 needs round-HALF-TO-EVEN (banker's rounding), not round-half-up -
-// a naive (raw+12)/24 disagrees on ties, and since MFM decoding is fully
-// sequential, one wrong unit permanently misaligns everything after it.
+// Banker's rounding, not (raw+12)/24: one wrong unit misaligns everything after it.
 static inline int __not_in_flash_func(roundHalfToEven24)(int32_t raw) {
   int32_t q = raw / 24;
   int32_t r = raw % 24;
@@ -268,11 +261,7 @@ static inline void __not_in_flash_func(flushPendingUnit)() {
   }
 }
 
-// ============================================================================
-// Byte/CRC decode over the completed cellBits buffer (random-access, run
-// only after a full revolution has been captured - no real-time constraint
-// here, the disk has already passed this data).
-// ============================================================================
+// -- byte and CRC decode over a captured revolution (no timing constraint) --
 
 static bool __not_in_flash_func(decodeByteAt)(uint32_t pos, uint8_t *outByte) {
   if (pos + 16 > cellBitCount) return false;
@@ -291,10 +280,7 @@ static bool __not_in_flash_func(decodeBytesAt)(uint32_t pos, int n, uint8_t *out
   return true;
 }
 
-// Table-driven CRC16-CCITT: same result as the bit-loop it replaces, one
-// table lookup per byte instead of 8 shift-and-branch iterations. Called on
-// every IDAM candidate (up to a few hundred per track) and every sector
-// payload, so this adds up across a cylinder read's retries.
+// Table-driven CRC16-CCITT - it runs on every IDAM candidate and sector.
 static uint16_t crc16Table[256];
 
 static void initCrc16Table() {
@@ -320,8 +306,8 @@ struct IdamResult {
   uint32_t bitAfterIdam;
 };
 
-static bool __not_in_flash_func(tryDecodeIdam)(uint32_t syncPos, IdamResult *out) {
-  uint32_t after = syncPos + 48;
+static bool __not_in_flash_func(tryDecodeIdam)(uint32_t syncPos, bool singlePattern, IdamResult *out) {
+  uint32_t after = syncPos + (singlePattern ? 16 : 48);
   uint8_t fields[7];
   if (!decodeBytesAt(after, 7, fields)) return false;
   if (fields[0] != 0xFE) return false;
@@ -375,7 +361,7 @@ static bool __not_in_flash_func(findDam)(uint32_t searchStart, uint8_t *outMark,
 }
 
 static bool __not_in_flash_func(decodeDamPayload)(uint8_t mark, uint32_t dataStart, uint8_t *outData512) {
-  static uint8_t payload[514]; // static: this sits several frames deep in a non-reentrant capture call chain
+  static uint8_t payload[514]; // static: deep, non-reentrant call chain
   if (!decodeBytesAt(dataStart, 514, payload)) return false;
   static uint8_t crcBuf[4 + 512];
   crcBuf[0] = 0xA1; crcBuf[1] = 0xA1; crcBuf[2] = 0xA1; crcBuf[3] = mark;
@@ -387,12 +373,7 @@ static bool __not_in_flash_func(decodeDamPayload)(uint8_t mark, uint32_t dataSta
   return true;
 }
 
-// ============================================================================
-// Per-cylinder sector cache. Multiple cylinders cached at once (LRU
-// eviction) since different tracks in a multi-track MIDI file are usually
-// positioned on different cylinders simultaneously - a single-slot cache
-// would evict and reseek constantly.
-// ============================================================================
+// -- per-cylinder sector cache (LRU) --
 
 static const int SECTORS_PER_TRACK = 18;
 static const int NUM_HEADS = 2;
@@ -403,36 +384,38 @@ static int cachedCyl[NUM_CACHE_SLOTS];
 static uint32_t slotLastUsed[NUM_CACHE_SLOTS];
 static uint32_t cacheUseCounter;
 
-// Consecutive invalidate-and-refetch cycles per cylinder (see readSector())
-// - caps how many times a single marginal cylinder can force a full fresh
-// 3-attempt recapture before we just accept whatever it gave us, rather
-// than truly forever. See config.h (MAX_CYLINDER_REFETCH_STREAK).
-static uint8_t cylinderMissStreak[NUM_CYLINDERS];
+// Visits in a row that captured nothing; at the cap it's skipped until remount.
+static uint8_t cylinderTotalFailStreak[NUM_CYLINDERS];
+
+// Recaptures in a row still missing a sector - separate, so one bad sector
+// doesn't get a mostly good cylinder abandoned.
+static uint8_t cylinderPartialMissStreak[NUM_CYLINDERS];
+
+static bool cylinderCaptureGiveUp[NUM_CYLINDERS];
+
+// Only a fully clean capture resets the partial-miss streak.
+static bool cylinderSlotFullyGood[NUM_CACHE_SLOTS];
+
+// IDAMs agreeing on an unexpected cylinder (a lost step). Logged only.
+static int g_seekMismatchCyl = -1;
+static int g_seekMismatchAgreeCount = 0;
+#define SEEK_MISMATCH_CONFIRM_COUNT 6
 
 static void invalidateSectorCache() {
-  for (int s = 0; s < NUM_CACHE_SLOTS; s++) { cachedCyl[s] = -1; slotLastUsed[s] = 0; }
+  for (int s = 0; s < NUM_CACHE_SLOTS; s++) { cachedCyl[s] = -1; slotLastUsed[s] = 0; cylinderSlotFullyGood[s] = false; }
   cacheUseCounter = 0;
-  for (int c = 0; c < NUM_CYLINDERS; c++) cylinderMissStreak[c] = 0;
+  for (int c = 0; c < NUM_CYLINDERS; c++) { cylinderTotalFailStreak[c] = 0; cylinderPartialMissStreak[c] = 0; cylinderCaptureGiveUp[c] = false; }
 }
 
 static FloppyError g_lastError = FLOPPY_OK;
-static int g_lastFailCyl = -1, g_lastFailHead = -1, g_lastFailSector = -1;
-static uint32_t g_readCount = 0; // real seek+capture attempts (cache misses), not cache hits
 
 FloppyError floppy_last_error() { return g_lastError; }
-void floppy_last_sector_failure(int *cyl, int *head, int *sector) {
-  *cyl = g_lastFailCyl;
-  *head = g_lastFailHead;
-  *sector = g_lastFailSector;
-}
-uint32_t floppy_read_count() { return g_readCount; }
 
 static uint32_t lastTransitionCount;
 
-// Returns false if no disk is present/spinning (INDEX never pulsed within
-// the timeout) instead of hanging forever - a real disk spins at
-// ~200ms/revolution, so 1000ms per wait is generous margin.
-static bool __not_in_flash_func(captureOneRevolutionToCellbits)() {
+// Captures one revolution. *outNoIndexAtAll means no disk, not worth retrying.
+static bool __not_in_flash_func(captureOneRevolutionToCellbits)(bool *outNoIndexAtAll = nullptr) {
+  if (outNoIndexAtAll) *outNoIndexAtAll = false;
   cellBitCount = 0;
   havePendingUnit = false;
   lastTransitionCount = 0;
@@ -444,18 +427,39 @@ static bool __not_in_flash_func(captureOneRevolutionToCellbits)() {
 
   uint32_t waitStart = millis();
   while (gpio_get(pinIndex) == 0) { // wait for idle-high
-    if (millis() - waitStart > INDEX_WAIT_TIMEOUT_MS) return false;
+    if (millis() - waitStart > INDEX_WAIT_TIMEOUT_MS) {
+      if (outNoIndexAtAll) *outNoIndexAtAll = true;
+#if FLOPPY_DIAGNOSTIC_LOG
+      DBG_SERIAL.println("floppy: INDEX never went idle-high - drive reports no rotation at all (motor/clamping/INDEX sensor or wiring - not a media/read problem).");
+#endif
+      return false;
+    }
   }
   waitStart = millis();
   while (gpio_get(pinIndex) != 0) { // wait for falling edge
-    if (millis() - waitStart > INDEX_WAIT_TIMEOUT_MS) return false;
+    if (millis() - waitStart > INDEX_WAIT_TIMEOUT_MS) {
+      if (outNoIndexAtAll) *outNoIndexAtAll = true;
+#if FLOPPY_DIAGNOSTIC_LOG
+      DBG_SERIAL.println("floppy: INDEX went idle-high but never pulsed - drive reports no rotation at all (motor/clamping/INDEX sensor or wiring - not a media/read problem).");
+#endif
+      return false;
+    }
   }
 
   pio_sm_set_enabled(capturePio, captureSm, true);
 
+  // pio_sm_get_blocking() has no timeout - a pulled disk would hang here.
+  uint32_t firstWordStart = millis();
+  while (!fifoDataAvailable()) {
+    if (millis() - firstWordStart > INDEX_WAIT_TIMEOUT_MS) {
+      pio_sm_set_enabled(capturePio, captureSm, false);
+      return false;
+    }
+  }
+
   uint16_t last = fifoRead();
   bool lastIndex = gpio_get(pinIndex);
-  uint32_t revStart = millis(); // covers a mid-revolution fault (e.g. INDEX stops pulsing) the pre-capture wait above can't catch
+  uint32_t revStart = millis(); // catches INDEX stopping mid-revolution
 
   while (true) {
     bool nowIndex = gpio_get(pinIndex);
@@ -485,17 +489,11 @@ static bool __not_in_flash_func(captureOneRevolutionToCellbits)() {
   return true;
 }
 
-// Gated behind FLOPPY_VERBOSE_CAPTURE_LOG (default off) - Serial output from
-// inside this hot path caused real audio glitches (host-dependent blocking,
-// and Print isn't RAM-resident like the rest of this file). Flip to 1 to
-// debug a mount/recovery problem.
-#define FLOPPY_VERBOSE_CAPTURE_LOG 1 // TEMP: diagnosing repeated full-retry cylinder reads - flip back to 0 after
+// Per-capture trace on DBG_SERIAL. Off: serial I/O in this hot path disturbs capture.
+#define FLOPPY_VERBOSE_CAPTURE_LOG 0
 static int diagIdamCrcOk, diagDamFound, diagDamCrcOk;
 
-// Does NOT reset sectorPresent[slot][head][*] at the start - see
-// ensureCylinderCached(), which resets it once per cylinder rather than
-// once per attempt, so sectors found on an earlier attempt survive even if
-// a later attempt's different revolution doesn't find that same sector again.
+// Adds good sectors to the slot; earlier attempts' sectors are kept.
 static void __not_in_flash_func(decodeCurrentTrackIntoCache)(int slot, int cyl, int head) {
   diagIdamCrcOk = 0;
   diagDamFound = 0;
@@ -503,10 +501,26 @@ static void __not_in_flash_func(decodeCurrentTrackIntoCache)(int slot, int cyl, 
 
   for (int c = 0; c < candidateCount; c++) {
     IdamResult idam;
-    if (!tryDecodeIdam(candidatePositions[c], &idam)) continue;
+    if (!tryDecodeIdam(candidatePositions[c], candidateSinglePattern[c], &idam)) continue;
     diagIdamCrcOk++;
     if (idam.sector < 1 || idam.sector > SECTORS_PER_TRACK) continue;
-    if (idam.cyl != cyl || idam.head != head) continue; // disk disagrees with where we think we seeked - a mechanical seek error, don't trust this sector
+    if (idam.head != head) continue;
+    if (idam.cyl != cyl) {
+      if (idam.cyl == g_seekMismatchCyl) g_seekMismatchAgreeCount++;
+      else { g_seekMismatchCyl = idam.cyl; g_seekMismatchAgreeCount = 1; }
+#if FLOPPY_DIAGNOSTIC_LOG
+      DBG_SERIAL.print("floppy: asked for cyl=");
+      DBG_SERIAL.print(cyl);
+      DBG_SERIAL.print(" head=");
+      DBG_SERIAL.print(head);
+      DBG_SERIAL.print(" but a CRC-valid IDAM says cyl=");
+      DBG_SERIAL.print(idam.cyl);
+      DBG_SERIAL.print(" (agree count for that value: ");
+      DBG_SERIAL.print(g_seekMismatchAgreeCount);
+      DBG_SERIAL.println(")");
+#endif
+      continue; // head is on a different cylinder than expected
+    }
 
     uint8_t mark;
     uint32_t dataStart;
@@ -524,52 +538,50 @@ static void __not_in_flash_func(decodeCurrentTrackIntoCache)(int slot, int cyl, 
 #if FLOPPY_VERBOSE_CAPTURE_LOG
   int presentCount = 0;
   for (int s = 0; s < SECTORS_PER_TRACK; s++) if (sectorPresent[slot][head][s]) presentCount++;
-  Serial.print("    head=");
-  Serial.print(head);
-  Serial.print(": ");
-  Serial.print(lastTransitionCount);
-  Serial.print(" transitions, ");
-  Serial.print(cellBitCount);
-  Serial.print(" cellbits, ");
-  Serial.print(candidateCount);
-  Serial.print(" sync candidates, ");
-  Serial.print(diagIdamCrcOk);
-  Serial.print(" IDAM CRC-ok, ");
-  Serial.print(diagDamFound);
-  Serial.print(" DAM found, ");
-  Serial.print(diagDamCrcOk);
-  Serial.print(" DAM CRC-ok, ");
-  Serial.print(presentCount);
-  Serial.println("/18 sectors recovered");
+  DBG_SERIAL.print("    head=");
+  DBG_SERIAL.print(head);
+  DBG_SERIAL.print(": ");
+  DBG_SERIAL.print(lastTransitionCount);
+  DBG_SERIAL.print(" transitions, ");
+  DBG_SERIAL.print(cellBitCount);
+  DBG_SERIAL.print(" cellbits, ");
+  DBG_SERIAL.print(candidateCount);
+  DBG_SERIAL.print(" sync candidates, ");
+  DBG_SERIAL.print(diagIdamCrcOk);
+  DBG_SERIAL.print(" IDAM CRC-ok, ");
+  DBG_SERIAL.print(diagDamFound);
+  DBG_SERIAL.print(" DAM found, ");
+  DBG_SERIAL.print(diagDamCrcOk);
+  DBG_SERIAL.print(" DAM CRC-ok, ");
+  DBG_SERIAL.print(presentCount);
+  DBG_SERIAL.println("/18 sectors recovered");
 #endif
 }
 
-// Returns the cache slot holding cyl's data (loading it first if needed),
-// or -1 on failure. Picks an empty slot if one exists, else evicts the
-// least-recently-used one.
-static int skipPin1 = -1;
-static int skipPin2 = -1;
+// Drive Select stays on when the motor stops, so DSKCHG stays readable.
+static bool motorOn = true; // floppy_init() starts it
+static uint32_t lastActivityMs = 0;
 
-void floppy_set_skip_pins(int pin1, int pin2) {
-  skipPin1 = pin1;
-  skipPin2 = pin2;
+static void spinUp() {
+  lastActivityMs = millis();
+  if (motorOn) return;
+  digitalWrite(pinMotorEnable, LOW);
+  delay(600); // spindle up to speed
+  motorOn = true;
 }
 
-static inline bool skipRequested() {
-  return (skipPin1 >= 0 && digitalRead(skipPin1) == LOW) ||
-         (skipPin2 >= 0 && digitalRead(skipPin2) == LOW);
+void floppy_idle() {
+  if (motorOn && millis() - lastActivityMs > FLOPPY_MOTOR_IDLE_MS) {
+    digitalWrite(pinMotorEnable, HIGH);
+    motorOn = false;
+  }
 }
 
+// Slot holding cyl's sectors, capturing them if needed; -1 on failure.
 static int ensureCylinderCached(int cyl) {
-  // A real disk only has NUM_CYLINDERS tracks - reject anything outside
-  // that range immediately rather than seeking somewhere physically
-  // impossible (a garbage LBA/cluster value upstream would otherwise waste
-  // time and read noise).
+  lastActivityMs = millis();
   if (cyl < 0 || cyl >= NUM_CYLINDERS) {
     g_lastError = FLOPPY_ERR_SECTOR_UNRECOVERABLE;
-    g_lastFailCyl = cyl;
-    g_lastFailHead = -1;
-    g_lastFailSector = -1;
     return -1;
   }
 
@@ -578,6 +590,11 @@ static int ensureCylinderCached(int cyl) {
       slotLastUsed[slot] = ++cacheUseCounter;
       return slot;
     }
+  }
+
+  if (cylinderCaptureGiveUp[cyl]) {
+    g_lastError = FLOPPY_ERR_SECTOR_UNRECOVERABLE;
+    return -1;
   }
 
   int slot = -1;
@@ -590,56 +607,81 @@ static int ensureCylinderCached(int cyl) {
       if (slotLastUsed[s] < slotLastUsed[slot]) slot = s;
   }
 
-  g_readCount++; // a genuine cache miss - about to seek and capture for real
-  seekToCylinder(cyl);
 
-  // Reset once per cylinder, not per attempt - see decodeCurrentTrackIntoCache().
+  spinUp();
+  seekToCylinder(cyl);
+  g_seekMismatchCyl = -1;
+  g_seekMismatchAgreeCount = 0;
+  // Reset once per cylinder visit, not per attempt - see decodeCurrentTrackIntoCache().
   for (int h = 0; h < NUM_HEADS; h++)
     for (int s = 0; s < SECTORS_PER_TRACK; s++)
       sectorPresent[slot][h][s] = false;
 
+  bool everCaptured = false; // any attempt completed a capture on both heads
+  bool allGood = false;
   for (int attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0 && skipRequested()) break; // don't burn more retries on this cylinder
 #if FLOPPY_VERBOSE_CAPTURE_LOG
-    Serial.print("  cyl=");
-    Serial.print(cyl);
-    Serial.print(" slot=");
-    Serial.print(slot);
-    Serial.print(" attempt=");
-    Serial.println(attempt);
+    DBG_SERIAL.print("  cyl=");
+    DBG_SERIAL.print(cyl);
+    DBG_SERIAL.print(" slot=");
+    DBG_SERIAL.print(slot);
+    DBG_SERIAL.print(" attempt=");
+    DBG_SERIAL.println(attempt);
 #endif
-
+    bool noIndexAtAll = false;
     selectHead(0);
-    if (!captureOneRevolutionToCellbits()) {
-      cachedCyl[slot] = -1; // slot may have held a different, still-good cylinder before eviction - don't leave that stale
-      g_lastError = FLOPPY_ERR_SECTOR_UNRECOVERABLE;
-      g_lastFailCyl = cyl;
-      g_lastFailHead = 0;
-      g_lastFailSector = -1;
-      return -1;
+    if (!captureOneRevolutionToCellbits(&noIndexAtAll)) {
+      // No INDEX at all means no disk - retrying the same wait can't help.
+      if (noIndexAtAll) break;
+      continue;
     }
     decodeCurrentTrackIntoCache(slot, cyl, 0);
 
     selectHead(1);
-    if (!captureOneRevolutionToCellbits()) {
-      cachedCyl[slot] = -1;
-      g_lastError = FLOPPY_ERR_SECTOR_UNRECOVERABLE;
-      g_lastFailCyl = cyl;
-      g_lastFailHead = 1;
-      g_lastFailSector = -1;
-      return -1;
+    if (!captureOneRevolutionToCellbits(&noIndexAtAll)) {
+      if (noIndexAtAll) break;
+      continue;
     }
     decodeCurrentTrackIntoCache(slot, cyl, 1);
+    everCaptured = true;
 
-    bool allGood = true;
+    allGood = true;
     for (int h = 0; h < NUM_HEADS && allGood; h++)
       for (int s = 0; s < SECTORS_PER_TRACK; s++)
         if (!sectorPresent[slot][h][s]) { allGood = false; break; }
-    if (allGood) break; // don't waste a retry revolution if everything came back clean
+    if (allGood) break;
+  }
+
+#if FLOPPY_DIAGNOSTIC_LOG
+  if (!allGood && g_seekMismatchAgreeCount >= SEEK_MISMATCH_CONFIRM_COUNT) {
+    DBG_SERIAL.print("floppy: seek-mismatch signal at assumed cyl=");
+    DBG_SERIAL.print(cyl);
+    DBG_SERIAL.print(", disk reports cyl=");
+    DBG_SERIAL.println(g_seekMismatchCyl);
+  }
+#endif
+
+  lastActivityMs = millis(); // the idle timer starts after the capture, not before
+  if (!everCaptured) {
+#if FLOPPY_DIAGNOSTIC_LOG
+    DBG_SERIAL.print("floppy: cyl=");
+    DBG_SERIAL.print(cyl);
+    DBG_SERIAL.println(": no complete capture on either head - no usable signal here.");
+#endif
+    cachedCyl[slot] = -1; // the slot's previous cylinder was already overwritten
+    g_lastError = FLOPPY_ERR_SECTOR_UNRECOVERABLE;
+    if (cylinderTotalFailStreak[cyl] < MAX_CYLINDER_REFETCH_STREAK) {
+      cylinderTotalFailStreak[cyl]++;
+    } else {
+      cylinderCaptureGiveUp[cyl] = true;
+    }
+    return -1;
   }
 
   cachedCyl[slot] = cyl;
   slotLastUsed[slot] = ++cacheUseCounter;
+  cylinderSlotFullyGood[slot] = allGood;
+  cylinderTotalFailStreak[cyl] = 0;
   return slot;
 }
 
@@ -647,34 +689,35 @@ static bool readSector(int cyl, int head, int sector, uint8_t *out512) {
   int slot = ensureCylinderCached(cyl);
   if (slot == -1) return false;
   if (!sectorPresent[slot][head][sector - 1]) {
+#if FLOPPY_DIAGNOSTIC_LOG
+    int presentCount = 0;
+    for (int s = 0; s < SECTORS_PER_TRACK; s++) if (sectorPresent[slot][head][s]) presentCount++;
+    DBG_SERIAL.print("floppy: cyl=");
+    DBG_SERIAL.print(cyl);
+    DBG_SERIAL.print(" head=");
+    DBG_SERIAL.print(head);
+    DBG_SERIAL.print(" sector=");
+    DBG_SERIAL.print(sector);
+    DBG_SERIAL.print(": capture succeeded (");
+    DBG_SERIAL.print(presentCount);
+    DBG_SERIAL.print("/");
+    DBG_SERIAL.print(SECTORS_PER_TRACK);
+    DBG_SERIAL.println(" sectors on this head) but not this one - a marginal sector.");
+#endif
     g_lastError = FLOPPY_ERR_SECTOR_UNRECOVERABLE;
-    g_lastFailCyl = cyl;
-    g_lastFailHead = head;
-    g_lastFailSector = sector;
-    // A cylinder stays marked cached even if some sectors never came back
-    // CRC-valid (otherwise one marginal sector would make the whole
-    // cylinder retry forever). That means this specific miss would
-    // otherwise be permanent unless we invalidate so the next call gets a
-    // genuinely fresh capture - a marginal sector can succeed on a
-    // different revolution. But cap how many times we'll do that per
-    // cylinder: a cylinder that's consistently borderline (never quite
-    // clean, not transiently bad) can otherwise retry forever - real
-    // hardware logs showed one refetched 5 times in a row, ~2.5s each.
-    // Past the cap, accept the best capture we have and stop retrying.
-    if (cyl >= 0 && cyl < NUM_CYLINDERS && cylinderMissStreak[cyl] < MAX_CYLINDER_REFETCH_STREAK) {
-      cylinderMissStreak[cyl]++;
+    // Recapture on the next read (up to the cap) - it may come back.
+    if (cyl >= 0 && cyl < NUM_CYLINDERS && cylinderPartialMissStreak[cyl] < MAX_CYLINDER_REFETCH_STREAK) {
+      cylinderPartialMissStreak[cyl]++;
       cachedCyl[slot] = -1;
     }
     return false;
   }
-  if (cyl >= 0 && cyl < NUM_CYLINDERS) cylinderMissStreak[cyl] = 0; // this cylinder is behaving now
+  if (cyl >= 0 && cyl < NUM_CYLINDERS && cylinderSlotFullyGood[slot]) cylinderPartialMissStreak[cyl] = 0;
   memcpy(out512, sectorCache[slot][head][sector - 1], 512);
   return true;
 }
 
-// ============================================================================
-// FAT12 layer.
-// ============================================================================
+// -- FAT12 --
 
 struct Bpb {
   uint16_t bytesPerSector;
@@ -694,8 +737,7 @@ static uint32_t rootSectorCount;
 #define MAX_FAT_BYTES 7168 // FAT12's own format ceiling is ~4084 clusters (~6126 bytes)
 static uint8_t fatBytes[MAX_FAT_BYTES];
 
-#define MAX_ROOT_ENTRIES 32
-static FloppyDirEntry rootEntries[MAX_ROOT_ENTRIES];
+static FloppyDirEntry rootEntries[MAX_DIR_ENTRIES];
 static int rootEntryCount;
 
 static void lbaToChs(uint32_t lba, int *cyl, int *head, int *sector) {
@@ -731,8 +773,7 @@ static int readFatChain(uint16_t startCluster, uint16_t *outClusters, int maxClu
   return n;
 }
 
-// Shared by the root directory and subdirectory listings (identical 32-byte
-// entry format).
+// Root and subdirectories share the 32-byte entry format.
 static int parseDirectoryBytes(const uint8_t *buf, uint32_t len, FloppyDirEntry *out, int maxOut, bool skipDotEntries) {
   int n = 0;
   for (uint32_t i = 0; i + 32 <= len && n < maxOut; i += 32) {
@@ -743,12 +784,16 @@ static int parseDirectoryBytes(const uint8_t *buf, uint32_t len, FloppyDirEntry 
     uint8_t attr = entry[11];
     if (attr == 0x0F) continue; // LFN entry
 
+    // Names end at the padding; a volume label keeps its inner spaces.
+    bool label = (attr & 0x08) && !(attr & 0x10);
     char name[9], ext[4];
     int nl = 0;
-    for (int k = 0; k < 8 && entry[k] != ' '; k++) name[nl++] = entry[k];
+    for (int k = 0; k < 8 && (label || entry[k] != ' '); k++) name[nl++] = entry[k];
+    while (nl > 0 && name[nl - 1] == ' ') nl--;
     name[nl] = 0;
     int el = 0;
-    for (int k = 0; k < 3 && entry[8 + k] != ' '; k++) ext[el++] = entry[8 + k];
+    for (int k = 0; k < 3 && (label || entry[8 + k] != ' '); k++) ext[el++] = entry[8 + k];
+    while (el > 0 && ext[el - 1] == ' ') el--;
     ext[el] = 0;
 
     if (skipDotEntries && name[0] == '.') continue;
@@ -773,13 +818,7 @@ bool floppy_init() {
   pinMode(pinTrack00, INPUT);
   pinMode(pinIndex, INPUT);
   pinMode(pinReadData, INPUT);
-  // INPUT_PULLUP, not plain INPUT like the other three above: this pin isn't
-  // physically wired yet (see README), so without a defined idle state it
-  // floats and picks up noise (this drive's stepper motor is a known noise
-  // source elsewhere in this project) - any spurious LOW reads as "disk
-  // changed" and force-resets playback to track 1 regardless of Loop/Shuffle.
-  // The internal pull-up won't conflict with the real external pull-up this
-  // pin is meant to eventually get; that will simply dominate once wired.
+  // Pulled up so an unwired DSKCHG doesn't float and read as a disk change.
   pinMode(pinDiskChange, INPUT_PULLUP);
 
   digitalWrite(pinDriveSelect, HIGH);
@@ -792,43 +831,42 @@ bool floppy_init() {
   digitalWrite(pinDriveSelect, LOW);
   delay(600);
 
-  homeToTrack0();
+  bool homed = homeToTrack0();
+  if (!homed) {
+    DBG_SERIAL.println("floppy_init(): Track00 never went low while homing - check the sensor, cable and disk.");
+  }
   currentCyl = 0;
   invalidateSectorCache();
   setupFluxPio();
-  return true;
-}
-
-static bool motorOn = true; // floppy_init() (above) already turned it on
-
-void floppy_motor_on() {
-  if (motorOn) return;
-  digitalWrite(pinDriveSelect, LOW);
-  digitalWrite(pinMotorEnable, LOW);
-  delay(600);
-  motorOn = true;
-}
-
-void floppy_motor_off() {
-  digitalWrite(pinMotorEnable, HIGH);
-  digitalWrite(pinDriveSelect, HIGH);
-  motorOn = false;
+  lastActivityMs = millis();
+  return homed;
 }
 
 bool floppy_disk_change_asserted() {
-  return digitalRead(pinDiskChange) == LOW;
+  // Debounced: stepper noise can pull one sample low and cause a false remount.
+  for (int i = 0; i < 4; i++) {
+    if (digitalRead(pinDiskChange) != LOW) return false;
+    if (i < 3) delayMicroseconds(200);
+  }
+  return true;
 }
 
 bool floppy_remount() {
-  stepOnce(true); // guarantee a real step pulse even if already at cylinder 0 - DSKCHG only clears on an actual step
-  homeToTrack0();
+  DBG_SERIAL.println("floppy_remount() called."); // repeated lines = a false DSKCHG storm
+  spinUp();
+  // A fresh disk needs time to clamp and reach speed.
+  delay(600);
+  stepOnce(true); // DSKCHG only clears on a real step, even at cylinder 0
+  if (!homeToTrack0()) {
+    DBG_SERIAL.println("floppy_remount(): Track00 never went low while homing.");
+  }
   currentCyl = 0;
   invalidateSectorCache();
   return floppy_mount();
 }
 
 bool floppy_mount() {
-  static uint8_t boot[512]; // static: same reasoning as decodeDamPayload's buffers - deep, non-reentrant call chain
+  static uint8_t boot[512]; // static: deep, non-reentrant call chain
   if (!readSector(0, 0, 1, boot)) return false;
 
   bpb.bytesPerSector = boot[11] | ((uint16_t)boot[12] << 8);
@@ -840,10 +878,7 @@ bool floppy_mount() {
   bpb.sectorsPerTrack = boot[24] | ((uint16_t)boot[25] << 8);
   bpb.numHeads = boot[26] | ((uint16_t)boot[27] << 8);
 
-  // Upper bounds matter, not just non-zero: sectorsPerTrack/numHeads feed
-  // straight into sectorCache[][][]'s fixed dimensions (lbaToChs -> readSector),
-  // and sectorsPerCluster is a divisor below - an out-of-spec or corrupt BPB
-  // would otherwise overflow the cache or divide by zero.
+  // Bounds matter: these size the cache arrays, and sectorsPerCluster divides.
   if (bpb.bytesPerSector != 512 || bpb.sectorsPerTrack == 0 || bpb.numHeads == 0 ||
       bpb.sectorsPerTrack > SECTORS_PER_TRACK || bpb.numHeads > NUM_HEADS ||
       bpb.sectorsPerCluster == 0) {
@@ -873,7 +908,7 @@ bool floppy_mount() {
   for (uint32_t i = 0; i < rootSectorCount; i++) {
     if (!readLba(rootStartLba + i, rootBytes + i * 512)) return false;
   }
-  rootEntryCount = parseDirectoryBytes(rootBytes, rootSectorCount * 512, rootEntries, MAX_ROOT_ENTRIES, false);
+  rootEntryCount = parseDirectoryBytes(rootBytes, rootSectorCount * 512, rootEntries, MAX_DIR_ENTRIES, false);
 
   return true;
 }
@@ -889,7 +924,7 @@ int floppy_read_subdirectory(const FloppyDirEntry &dirEntry, FloppyDirEntry *out
     return -1;
   }
 
-  static uint8_t buf[8 * 512];
+  static uint8_t buf[16 * 512]; // 256 entries, room for long-filename entries too
   uint32_t total = 0;
   for (int i = 0; i < n; i++) {
     uint32_t lba = dataStartLba + (clusters[i] - 2) * bpb.sectorsPerCluster;
@@ -906,7 +941,7 @@ bool floppy_open_file_handle(const FloppyDirEntry &entry, FloppyFileHandle *hand
   handle->fileSize = entry.size;
   handle->clusterCount = 0;
 
-  if (entry.size == 0) return true; // valid handle, floppy_read_file_sector will just report out-of-range immediately
+  if (entry.size == 0) return true; // reads just report out of range
 
   if (entry.startCluster == 0) {
     g_lastError = FLOPPY_ERR_NO_CLUSTERS;
@@ -917,9 +952,7 @@ bool floppy_open_file_handle(const FloppyDirEntry &entry, FloppyFileHandle *hand
     g_lastError = FLOPPY_ERR_NO_CLUSTERS;
     return false;
   }
-  // A chain that fills the whole array might be truncated rather than
-  // genuinely ending at the cap - only way to know is if the declared file
-  // size implies more clusters than we actually read.
+  // A chain that fills the array may have been cut short.
   uint32_t neededClusters = (entry.size + (uint32_t)bpb.sectorsPerCluster * 512 - 1) / ((uint32_t)bpb.sectorsPerCluster * 512);
   if (handle->clusterCount >= FLOPPY_MAX_FILE_CLUSTERS && neededClusters > (uint32_t)handle->clusterCount) {
     g_lastError = FLOPPY_ERR_TOO_MANY_CLUSTERS;

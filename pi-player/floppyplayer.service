@@ -1,0 +1,32 @@
+# Template: system/install.sh fills in the user, paths and user id when installing.
+
+[Unit]
+Description=FloppyPlayer MIDI
+After=sound.target local-fs.target bluetooth.target
+Wants=sound.target
+# Stop after 4 crashes in a minute; see journalctl -u floppyplayer -b.
+StartLimitIntervalSec=60
+StartLimitBurst=4
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/FloppyPlayer-MIDI/pi-player
+ExecStart=/home/pi/FloppyPlayer-MIDI/pi-player/.venv/bin/python main.py
+# Wait up to 15s for PipeWire, or FluidSynth falls back to ALSA and skips the EQ.
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/pulse/native" ] && exit 0; sleep 0.5; done; exit 0'
+# Exit and shutdown return 0 and stay down; Restart returns 42 to come back.
+Restart=on-failure
+RestartSec=3
+
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+# Real-time priority for audio threads, or playback microstutters.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+
+SupplementaryGroups=video input dialout audio render bluetooth
+
+[Install]
+WantedBy=multi-user.target
