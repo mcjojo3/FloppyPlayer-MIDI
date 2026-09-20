@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
+SINK_PREFIX = "bluez_output."
 _DEVICE_LINE = re.compile(r"Device ([0-9A-F]{2}(?::[0-9A-F]{2}){5}) (.+)", re.I)
 
 
@@ -74,8 +75,18 @@ def scan(seconds: int = 10) -> None:
 def connect(address: str) -> bool:
     _ctl("power", "on")
     if "Paired: yes" not in _info(address):
+        _ctl("pairable", "on")  # "pairable" is BlueZ for "save the keys"
         _ctl("pair", address, timeout=30)
+        if "Bonded: no" in _info(address):
+            log.warning("%s paired but BlueZ didn't save it - it'll be forgotten at reboot "
+                        "(re-run system/install.sh to set AlwaysPairable)", address)
     _ctl("trust", address)
+    _ctl("connect", address, timeout=20)
+    return is_connected(address)
+
+
+def reconnect(address: str) -> bool:
+    """Connect a known speaker without pairing - quick to fail when it's off."""
     _ctl("connect", address, timeout=20)
     return is_connected(address)
 
@@ -90,4 +101,4 @@ def is_connected(address: str) -> bool:
 
 def sink_name(address: str) -> str:
     """The name WirePlumber gives a connected speaker's sink (prefix)."""
-    return "bluez_output." + address.replace(":", "_")
+    return SINK_PREFIX + address.replace(":", "_")

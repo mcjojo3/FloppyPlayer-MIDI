@@ -31,6 +31,11 @@ BACKEND_SD = 1
 
 OPEN_READ = 0
 
+# DISK_CHANGE_POLL answers. Firmware before the empty-drive probe only says 0 or 1.
+DISK_SAME = 0
+DISK_NEW = 1    # changed, and a disk is in: remount
+DISK_EMPTY = 2  # changed, and the drive is empty
+
 STATUS_OK = 0
 STATUS_NAMES = {
     0: "OK",
@@ -268,8 +273,9 @@ class LinkClient:
         except LinkStatusError:
             pass
 
-    def disk_change_poll(self) -> bool:
-        return self._checked(OP_DISK_CHANGE_POLL)[1] != 0
+    def disk_state(self) -> int:
+        """DISK_SAME, DISK_NEW or DISK_EMPTY."""
+        return self._checked(OP_DISK_CHANGE_POLL)[1]
 
     def card_poll(self) -> bool:
         return self._checked(OP_CARD_POLL)[1] != 0

@@ -14,6 +14,10 @@ void floppy_idle();
 // DSKCHG (ribbon pin 34): the disk was removed since the last step.
 bool floppy_disk_change_asserted();
 
+// 0 no change, 1 a new disk is in (until remounted), 2 the drive is empty. While
+// DSKCHG says removed, steps the head now and then - no spin-up - to look for a disk.
+uint8_t floppy_poll_disk_change();
+
 // Clears DSKCHG, drops the cache and mounts again. Rebuild the playlist after.
 bool floppy_remount();
 
@@ -27,6 +31,11 @@ struct FloppyDirEntry {
 
 int floppy_root_entry_count();
 const FloppyDirEntry &floppy_root_entry(int index);
+
+// Fingerprint of the mounted disk (boot sector, FAT and root directory) and of
+// one file on it: together they name the file's copy in the SD cache.
+uint32_t floppy_disk_id();
+uint32_t floppy_file_key(const FloppyDirEntry &entry);
 
 // Entries of a subdirectory, without "." and ".."; -1 on error.
 int floppy_read_subdirectory(const FloppyDirEntry &dirEntry, FloppyDirEntry *outEntries, int maxEntries);

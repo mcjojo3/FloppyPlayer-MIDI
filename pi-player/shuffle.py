@@ -35,6 +35,14 @@ class ShuffleOrder:
             return self._order[i]
         return None
 
+    def go_to(self, position: Position) -> bool:
+        """Put the cursor on a track of this pass - where Prev landed through play history."""
+        try:
+            self._index = self._order.index(position)
+        except ValueError:
+            return False
+        return True
+
     def step(self, direction: int) -> Position | None:
         if not self._order:
             return None

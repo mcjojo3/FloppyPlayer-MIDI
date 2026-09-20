@@ -1,8 +1,6 @@
 # Earlier designs, kept locally only
 /archive/
 
-*.suo
-*.user
 # Python
 __pycache__/
 *.pyc
@@ -16,3 +14,4 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
+/pi-player/soundfonts

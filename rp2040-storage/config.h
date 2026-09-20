@@ -19,5 +19,11 @@
 // Spindle stops after this long without a read - the heads rest on the disk.
 #define FLOPPY_MOTOR_IDLE_MS 15000
 
+// With the drive empty, how often a poll steps the head to look for a new disk.
+#define FLOPPY_PROBE_INTERVAL_MS 4000
+
+// Keep a copy of every floppy file read on the SD card, served instead next time.
+#define SD_FLOPPY_CACHE 1
+
 // Entries per directory listing (one LIST response).
 #define MAX_DIR_ENTRIES 54

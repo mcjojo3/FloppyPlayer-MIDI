@@ -130,7 +130,13 @@ struct LinkReadRequest {
 };
 #pragma pack(pop)
 
-// DISK_CHANGE_POLL (floppy DSKCHG) / CARD_POLL (SD mounted); no request payload.
+// DISK_CHANGE_POLL / CARD_POLL (SD mounted); no request payload. For the floppy,
+// asserted is a LinkDiskState: a new disk stays reported until REMOUNT.
+enum LinkDiskState : uint8_t {
+  LINK_DISK_SAME  = 0,
+  LINK_DISK_NEW   = 1,
+  LINK_DISK_EMPTY = 2,
+};
 #pragma pack(push, 1)
 struct LinkPollResponse {
   uint8_t status;

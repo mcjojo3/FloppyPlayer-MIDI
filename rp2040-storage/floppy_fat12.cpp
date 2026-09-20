@@ -851,8 +851,45 @@ bool floppy_disk_change_asserted() {
   return true;
 }
 
+static bool g_newDisk = false; // seen by a probe, not yet remounted
+static uint32_t g_lastProbeMs = 0;
+
+uint8_t floppy_poll_disk_change() {
+  if (g_newDisk) return 1;
+  if (!floppy_disk_change_asserted()) return 0;
+  if (millis() - g_lastProbeMs < FLOPPY_PROBE_INTERVAL_MS) return 2;
+  g_lastProbeMs = millis();
+  // DSKCHG only clears on a step with a disk in, so step in and back out.
+  stepOnce(false);
+  stepOnce(true);
+  if (floppy_disk_change_asserted()) return 2;
+  g_newDisk = true;
+  return 1;
+}
+
+static uint32_t fnv1a(uint32_t hash, const void *data, uint32_t len) {
+  const uint8_t *bytes = (const uint8_t *)data;
+  for (uint32_t i = 0; i < len; i++) {
+    hash ^= bytes[i];
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+static uint32_t g_diskId = 0;
+
+uint32_t floppy_disk_id() { return g_diskId; }
+
+uint32_t floppy_file_key(const FloppyDirEntry &entry) {
+  uint32_t hash = fnv1a(2166136261u, entry.name, strnlen(entry.name, sizeof(entry.name)));
+  hash = fnv1a(hash, entry.ext, strnlen(entry.ext, sizeof(entry.ext)));
+  hash = fnv1a(hash, &entry.startCluster, sizeof(entry.startCluster));
+  return fnv1a(hash, &entry.size, sizeof(entry.size));
+}
+
 bool floppy_remount() {
   DBG_SERIAL.println("floppy_remount() called."); // repeated lines = a false DSKCHG storm
+  g_newDisk = false;
   spinUp();
   // A fresh disk needs time to clamp and reach speed.
   delay(600);
@@ -910,6 +947,9 @@ bool floppy_mount() {
   }
   rootEntryCount = parseDirectoryBytes(rootBytes, rootSectorCount * 512, rootEntries, MAX_DIR_ENTRIES, false);
 
+  // Any change to the disk's files changes the FAT or the root's entries (sizes, dates).
+  g_diskId = fnv1a(fnv1a(fnv1a(2166136261u, boot, 512), fatBytes, fatBytesNeeded),
+                   rootBytes, rootSectorCount * 512);
   return true;
 }
 

@@ -5,9 +5,14 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import re
 from pathlib import Path
 
+import lyrics
+
 log = logging.getLogger(__name__)
+
+_DB = re.compile(r"\s*([+-]?\d+(?:\.\d+)?)")
 
 
 def decode_midi_text(text: str) -> str:
@@ -38,27 +43,16 @@ TAG_KEYS = ("title", "artist", "album", "date", "tracknumber", "genre")
 
 
 def audio_info(path: Path | None, data: bytes) -> dict:
-    """Tags, stream details and cover art. Anything missing stays empty or 0."""
+    """Tags, stream details, cover art, lyrics and ReplayGain. Anything missing stays empty."""
     info = {key: "" for key in TAG_KEYS}
     info.update({"duration": 0.0, "art": None, "codec": "", "bitrate": 0, "sample_rate": 0,
-                 "channels": 0, "bits": 0})
+                 "channels": 0, "bits": 0, "lyrics": None, "replaygain": None})
     try:
         info["size"] = path.stat().st_size if path is not None else len(data)
     except OSError:
         info["size"] = 0
-    try:
-        import mutagen
-    except ImportError:
-        return info
-
-    def source():
-        return str(path) if path is not None else io.BytesIO(data)
-
-    try:
-        media = mutagen.File(source())
-    except Exception as exc:
-        log.debug("Could not read tags: %s", exc)
-        return info
+    media = _open(path, data)
+    info["lyrics"] = lyrics.find(path, media)  # a .lrc works even without readable tags
     if media is None:
         return info
     stream = media.info
@@ -69,7 +63,8 @@ def audio_info(path: Path | None, data: bytes) -> dict:
     info["codec"] = _CODECS.get(type(media).__name__, type(media).__name__)
 
     try:
-        easy = mutagen.File(source(), easy=True)
+        import mutagen
+        easy = mutagen.File(str(path) if path is not None else io.BytesIO(data), easy=True)
         tags = easy.tags if easy is not None else None
         for key in TAG_KEYS:
             value = tags.get(key) if tags else None
@@ -79,7 +74,46 @@ def audio_info(path: Path | None, data: bytes) -> dict:
         log.debug("Could not read easy tags: %s", exc)
 
     info["art"] = _cover_art(media)
+    info["replaygain"] = _replaygain(media)
     return info
+
+
+def _open(path: Path | None, data: bytes):
+    try:
+        import mutagen
+        return mutagen.File(str(path) if path is not None else io.BytesIO(data))
+    except Exception as exc:  # ImportError included: tags are optional
+        log.debug("Could not read tags: %s", exc)
+        return None
+
+
+def _db(text) -> float | None:
+    match = _DB.match(str(text))
+    return float(match.group(1)) if match else None
+
+
+def _replaygain(media) -> tuple[float, float | None] | None:
+    """(track gain dB, peak) from ReplayGain tags, if the file was tagged with them."""
+    try:
+        tags = getattr(media, "tags", None)
+        if tags is None:
+            return None
+        if hasattr(tags, "getall"):  # ID3
+            found = {f.desc.lower(): f.text[0] for f in tags.getall("TXXX") if f.text}
+            gain, peak = found.get("replaygain_track_gain"), found.get("replaygain_track_peak")
+            if gain is None:
+                rva2 = next((f for f in tags.getall("RVA2") if f.desc.lower() == "track"), None)
+                return (float(rva2.gain), float(rva2.peak) or None) if rva2 else None
+        else:
+            gain = (tags.get("replaygain_track_gain") or [None])[0]
+            peak = (tags.get("replaygain_track_peak") or [None])[0]
+        db = _db(gain) if gain is not None else None
+        if db is None:
+            return None
+        return db, (_db(peak) if peak is not None else None) or None
+    except Exception as exc:
+        log.debug("Unreadable ReplayGain tags: %s", exc)
+        return None
 
 
 def _cover_art(media) -> bytes | None:

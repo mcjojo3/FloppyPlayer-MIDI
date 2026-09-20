@@ -31,7 +31,7 @@ step() {
 
 install_packages() {
     sudo apt-get update || return 1
-    sudo apt-get install -y fluidsynth libfluidsynth3 python3-pygame python3-venv \
+    sudo apt-get install -y fluidsynth libfluidsynth3 python3-pygame python3-numpy python3-venv \
         bluez libspa-0.2-bluetooth fonts-noto-cjk
 }
 
@@ -72,6 +72,32 @@ EOF
         sudo chgrp video "$brightness" || return 1
         sudo chmod g+w "$brightness" || return 1
     done
+}
+
+usb_automount() {
+    # Read-only at /run/media/system/<label>; unmounted again when unplugged.
+    sudo mkdir -p /etc/udev/rules.d || return 1
+    sudo tee /etc/udev/rules.d/99-floppyplayer-usb.rules >/dev/null <<'EOF' || return 1
+ACTION=="add", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN{program}+="/usr/bin/systemd-mount --no-block --automount=no --collect --options=ro,nosuid,nodev,noexec $devnode"
+EOF
+    sudo udevadm control --reload
+}
+
+bluetooth_pairing() {
+    # With no agent running BlueZ pairs without saving the keys, so speakers are forgotten at reboot.
+    local conf=/etc/bluetooth/main.conf
+    if [ ! -f "$conf" ]; then
+        printf '[General]\nAlwaysPairable = true\n' | sudo tee "$conf" >/dev/null || return 1
+    elif grep -qE '^[#[:space:]]*AlwaysPairable[[:space:]]*=' "$conf"; then
+        sudo sed -i -E 's/^[#[:space:]]*AlwaysPairable[[:space:]]*=.*/AlwaysPairable = true/' "$conf" || return 1
+    else
+        sudo sed -i '/^\[General\]/a AlwaysPairable = true' "$conf" || return 1
+    fi
+    if ! grep -q '^AlwaysPairable = true' "$conf"; then
+        echo "   Couldn't set AlwaysPairable in $conf"
+        return 1
+    fi
+    sudo systemctl restart bluetooth
 }
 
 power_sudoers() {
@@ -118,12 +144,26 @@ for obj in json.load(sys.stdin):
 }
 
 service() {
+    if [ ! -s "$APP_DIR/floppyplayer.service" ]; then
+        echo "   $APP_DIR/floppyplayer.service is missing or empty - copy the whole pi-player/ folder again"
+        return 1
+    fi
     sed -e "s|^User=.*|User=$USER_NAME|" \
         -e "s|/home/pi/FloppyPlayer-MIDI/pi-player|$APP_DIR|g" \
         -e "s|/run/user/1000|/run/user/$USER_ID|g" \
         "$APP_DIR/floppyplayer.service" > "$TMP/floppyplayer.service" || return 1
+    # systemd treats an empty unit, or a link to /dev/null, as masked.
+    sudo systemctl unmask floppyplayer >/dev/null 2>&1
+    sudo systemctl unmask --runtime floppyplayer >/dev/null 2>&1
     sudo install -m 644 "$TMP/floppyplayer.service" /etc/systemd/system/floppyplayer.service || return 1
     sudo systemctl daemon-reload || return 1
+    local state
+    state="$(systemctl show -p LoadState --value floppyplayer)"
+    if [ "$state" != "loaded" ]; then
+        echo "   The service is '$state' after installing:"
+        systemctl status floppyplayer --no-pager -l | head -5
+        return 1
+    fi
     sudo systemctl enable floppyplayer
 }
 
@@ -132,6 +172,8 @@ step "Python environment" python_env
 step "Groups" add_groups
 step "Real-time audio limits" realtime_limits
 step "Backlight access (screen dimming)" backlight_access
+step "USB drive automount" usb_automount
+step "Bluetooth pairings kept across reboots" bluetooth_pairing
 step "Passwordless shutdown/reboot" power_sudoers
 step "PipeWire buffer + EQ" pipewire_eq
 step "Service" service

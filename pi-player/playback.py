@@ -15,6 +15,9 @@ from storage import Track
 
 log = logging.getLogger(__name__)
 
+# ReplayGain aims quiet, around -18 LUFS; this brings tagged tracks back near untagged ones.
+LOUDNESS_PREAMP_DB = 6.0
+
 
 class AudioPlayer:
     """Compressed/PCM audio via pygame.mixer."""
@@ -26,6 +29,7 @@ class AudioPlayer:
         self._start_at = 0.0
         self._duration = 0.0
         self.info: dict = {}
+        self.source: str | bytes = b""  # path or bytes of the loaded file
         self._playing = False
         self._paused = False
         self._loaded = False
@@ -43,8 +47,8 @@ class AudioPlayer:
         self.stop()
         self._ensure_mixer()
         # Local files stream off disk rather than sitting in RAM.
-        source = str(track.path) if track.path is not None else io.BytesIO(data)
-        pygame.mixer.music.load(source)
+        self.source = str(track.path) if track.path is not None else data  # for the bars
+        pygame.mixer.music.load(str(track.path) if track.path is not None else io.BytesIO(data))
         self.info = metadata.audio_info(track.path, data)
         self._duration = self.info["duration"]
         self._loaded = True
@@ -184,6 +188,7 @@ class Playback:
         polyphony: int = 128,
         reverb: bool = True,
         chorus: bool = False,
+        backups=(),
     ):
         # One 0-1 volume, trimmed per engine - their scales are unrelated.
         self._volume = max(0.0, min(volume, 1.0))
@@ -191,7 +196,7 @@ class Playback:
         self._audio_gain = audio_gain
         self.midi = midi_engine.MidiPlayer(
             soundfont, gain=self._volume * midi_gain, driver=driver, rate=rate,
-            polyphony=polyphony, reverb=reverb, chorus=chorus,
+            polyphony=polyphony, reverb=reverb, chorus=chorus, backups=backups,
         )
         self.audio = AudioPlayer(rate=rate)
         self.audio.set_volume(self._volume * audio_gain)
@@ -199,7 +204,8 @@ class Playback:
         self.audio.on_finished = self._finished
         self.on_finished = None
         self._active = None
-        self._headroom = 1.0
+        self._ceiling = 1.0  # highest level the EQ's boosts leave room for
+        self._loudness_match = False
         self.track: Track | None = None
 
     def _finished(self) -> None:
@@ -289,24 +295,45 @@ class Playback:
     def soundfont(self) -> str:
         return self.midi.soundfont
 
-    def set_soundfont(self, path) -> None:
+    def set_soundfont(self, path, backups=()) -> None:
         """Swap soundfonts mid-song, carrying on from the same spot."""
         if self._active is not self.midi:
-            self.midi.load_soundfont(path)
+            self.midi.load_soundfont(path, backups)
             return
         was_playing = self.midi.is_playing
         position = self.midi.position
         self.midi.pause()
-        self.midi.load_soundfont(path)
+        self.midi.load_soundfont(path, backups)
         # Re-applies programs and controllers at this point with the new font.
         self.midi.seek(position)
         if was_playing:
             self.midi.play()
 
-    def set_headroom_db(self, db: float) -> None:
-        """Drop the output so EQ boosts can't clip."""
-        self._headroom = 10 ** (-max(0.0, db) / 20)
+    def set_eq_boost_db(self, db: float) -> None:
+        """Cap the level so the EQ's largest boost can't clip; below the cap nothing changes."""
+        self._ceiling = 10 ** (-max(0.0, db) / 20)
         self.set_volume(self._volume)
+
+    def set_loudness_match(self, enabled: bool) -> None:
+        """Level audio files by their ReplayGain tags; untagged files are left alone."""
+        self._loudness_match = enabled
+        self.set_volume(self._volume)
+
+    @property
+    def track_gain_db(self) -> float | None:
+        """The ReplayGain adjustment in use for this track, None if there isn't one."""
+        tagged = self.audio.info.get("replaygain") if self._active is self.audio else None
+        return tagged[0] + LOUDNESS_PREAMP_DB if tagged and self._loudness_match else None
+
+    def _audio_level(self) -> float:
+        level, cap = self._volume * self._audio_gain, self._ceiling
+        gain_db = self.track_gain_db
+        if gain_db is not None:
+            level *= 10 ** (gain_db / 20)
+            peak = self.audio.info["replaygain"][1]
+            if peak:
+                cap /= max(peak, 0.1)  # the tagged peak says how much room there really is
+        return min(level, cap, 1.0)
 
     def seek(self, seconds: float) -> None:
         if self._active:
@@ -339,8 +366,8 @@ class Playback:
     def set_volume(self, volume: float) -> None:
         """volume is 0-1; each engine applies its own trim."""
         self._volume = max(0.0, min(volume, 1.0))
-        self.midi.set_gain(self._volume * self._midi_gain * self._headroom)
-        self.audio.set_volume(min(1.0, self._volume * self._audio_gain) * self._headroom)
+        self.midi.set_gain(min(self._volume * self._midi_gain, self._ceiling))
+        self.audio.set_volume(self._audio_level())
 
     def shutdown(self) -> None:
         self.audio.stop()

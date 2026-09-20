@@ -3,6 +3,7 @@
 // in startCluster's top bits: a reused slot fails cleanly and the Pi re-lists.
 #include "config.h"
 #include "sd_fat.h"
+#include <stdio.h>
 #include <string.h>
 
 static SdFat g_sd;
@@ -218,4 +219,49 @@ bool sd_read_file_range(SdFileHandle *handle, uint32_t offset, uint16_t length, 
   }
   *outGot = (uint16_t)got;
   return true;
+}
+
+// -- floppy cache --
+
+static void cachePath(char *out, size_t size, uint32_t diskId, uint32_t fileKey, const char *ext) {
+  snprintf(out, size, "/CACHE/%08lX/%08lX.%s", (unsigned long)diskId, (unsigned long)fileKey, ext);
+}
+
+bool sd_cache_open(uint32_t diskId, uint32_t fileKey, SdFileHandle *handle) {
+  if (!g_mounted) return false;
+  char path[40];
+  cachePath(path, sizeof(path), diskId, fileKey, "BIN");
+  handle->file.close();
+  if (!handle->file.open(&g_sd, path, O_RDONLY)) return false;
+  handle->fileSize = (uint32_t)handle->file.fileSize();
+  return true;
+}
+
+bool sd_cache_begin(uint32_t diskId, uint32_t fileKey, FsFile *out) {
+  if (!g_mounted) return false;
+  char dir[24];
+  snprintf(dir, sizeof(dir), "/CACHE/%08lX", (unsigned long)diskId);
+  if (!g_sd.exists(dir) && !g_sd.mkdir(dir, true)) return false;
+  char path[40];
+  cachePath(path, sizeof(path), diskId, fileKey, "TMP");
+  out->close();
+  return out->open(&g_sd, path, O_WRONLY | O_CREAT | O_TRUNC);
+}
+
+bool sd_cache_finish(uint32_t diskId, uint32_t fileKey, FsFile *file) {
+  bool ok = file->close();
+  char tmp[40], done[40];
+  cachePath(tmp, sizeof(tmp), diskId, fileKey, "TMP");
+  cachePath(done, sizeof(done), diskId, fileKey, "BIN");
+  if (ok && g_sd.exists(done)) g_sd.remove(done);
+  ok = ok && g_sd.rename(tmp, done);
+  if (!ok) g_sd.remove(tmp);
+  return ok;
+}
+
+void sd_cache_abandon(uint32_t diskId, uint32_t fileKey, FsFile *file) {
+  file->close();
+  char tmp[40];
+  cachePath(tmp, sizeof(tmp), diskId, fileKey, "TMP");
+  g_sd.remove(tmp);
 }

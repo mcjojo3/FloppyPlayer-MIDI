@@ -30,8 +30,7 @@ def normalise(gains) -> list[float]:
     return [max(-MAX_DB, min(MAX_DB, float(g))) for g in values]
 
 
-def headroom_db(gains) -> float:
-    """How far to drop the output so boosted bands can't clip."""
+def max_boost_db(gains) -> float:
     return max(0.0, max(normalise(gains)))
 
 

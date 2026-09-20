@@ -73,6 +73,10 @@ def set_default_sink(node_id: int) -> bool:
     return _run(["wpctl", "set-default", str(node_id)]) is not None
 
 
+def set_volume(node_id: int, level: float) -> bool:
+    return _run(["wpctl", "set-volume", str(node_id), f"{level:.2f}"]) is not None
+
+
 def set_target(node_id: int, sink: dict) -> bool:
     """Route a stream to a sink (target.object, plus the older target.node)."""
     ok = _run(["pw-metadata", str(node_id), "target.object", sink["name"]]) is not None

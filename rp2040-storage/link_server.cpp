@@ -23,9 +23,14 @@ static bool g_sdMounted = false;
 // Tagged by backend rather than a union: FsFile isn't trivially copyable.
 struct HandleSlot {
   bool inUse;
-  uint8_t backend;
+  uint8_t backend; // where reads come from
+  uint8_t origin;  // what the Pi opened: a floppy file may be served from its SD copy
   FloppyFileHandle fh;
   SdFileHandle sdfh;
+  // A floppy file being copied to the SD cache as the Pi reads it, front to back.
+  bool caching;
+  FsFile cacheFile;
+  uint32_t cached, diskId, fileKey;
 };
 static HandleSlot g_handles[LINK_MAX_HANDLES];
 
@@ -34,16 +39,65 @@ static uint32_t g_myBootId = 0;
 static uint32_t g_lastClientBootId = 0;
 static bool g_haveClientBootId = false;
 
+static void stopCaching(HandleSlot &slot) {
+  if (slot.caching) sd_cache_abandon(slot.diskId, slot.fileKey, &slot.cacheFile);
+  slot.caching = false;
+}
+
 static void releaseHandle(HandleSlot &slot) {
   if (slot.inUse && slot.backend == LINK_BACKEND_SD) slot.sdfh.file.close();
+  stopCaching(slot);
   slot.inUse = false;
 }
 
-// Only the remounted backend's handles go stale.
+// Only the remounted backend's handles go stale - cached floppy files count as both.
 static void resetHandles(uint8_t backend) {
   for (int i = 0; i < LINK_MAX_HANDLES; i++) {
-    if (g_handles[i].backend == backend) releaseHandle(g_handles[i]);
+    if (g_handles[i].backend == backend || g_handles[i].origin == backend) releaseHandle(g_handles[i]);
   }
+}
+
+// Copies what the Pi just read into the cache; anything but front-to-back gives up.
+static void cacheAppend(HandleSlot &h, uint32_t offset, const uint8_t *data, uint16_t len) {
+  if (!h.caching || offset + len <= h.cached) return; // a re-read of what's copied already
+  if (offset != h.cached || h.cacheFile.write(data, len) != len) {
+    stopCaching(h);
+    return;
+  }
+  h.cached += len;
+  if (h.cached >= h.fh.fileSize) {
+    if (!sd_cache_finish(h.diskId, h.fileKey, &h.cacheFile)) DBG_SERIAL.println("SD cache: could not save a copy.");
+    h.caching = false;
+  }
+}
+
+// A floppy file: its SD copy if there is one, else the disk, copying as it goes.
+static bool openFloppyFile(HandleSlot &h, const FloppyDirEntry &entry, uint32_t *outSize) {
+  h.origin = LINK_BACKEND_FLOPPY;
+  h.caching = false;
+#if SD_FLOPPY_CACHE
+  uint32_t diskId = floppy_disk_id(), fileKey = floppy_file_key(entry);
+  if (g_sdMounted && entry.size > 0 && sd_cache_open(diskId, fileKey, &h.sdfh)) {
+    if (h.sdfh.fileSize == entry.size) {
+      h.backend = LINK_BACKEND_SD;
+      *outSize = entry.size;
+      return true;
+    }
+    h.sdfh.file.close();
+  }
+#endif
+  h.backend = LINK_BACKEND_FLOPPY;
+  if (!floppy_open_file_handle(entry, &h.fh)) return false;
+  *outSize = h.fh.fileSize;
+#if SD_FLOPPY_CACHE
+  if (g_sdMounted && entry.size > 0 && sd_cache_begin(diskId, fileKey, &h.cacheFile)) {
+    h.caching = true;
+    h.cached = 0;
+    h.diskId = diskId;
+    h.fileKey = fileKey;
+  }
+#endif
+  return true;
 }
 
 static void resetAllHandles() {
@@ -264,17 +318,19 @@ static void handleOpen() {
     if (req->backend == LINK_BACKEND_FLOPPY) {
       FloppyDirEntry entry;
       fromLink(req->entry, &entry);
-      ok = floppy_open_file_handle(entry, &h.fh);
-      resp.fileSize = h.fh.fileSize;
+      uint32_t size = 0;
+      ok = openFloppyFile(h, entry, &size);
+      resp.fileSize = size; // not &resp.fileSize: the struct is packed
     } else {
       SdDirEntry entry;
       fromLink(req->entry, &entry);
       ok = sd_open_file_handle(entry, &h.sdfh);
       resp.fileSize = h.sdfh.fileSize;
+      h.backend = h.origin = LINK_BACKEND_SD;
+      h.caching = false;
     }
     if (ok) {
       h.inUse = true;
-      h.backend = req->backend;
       resp.status = LINK_STATUS_OK;
       resp.handle = (uint8_t)slot;
     } else {
@@ -320,7 +376,10 @@ static void handleRead() {
         got += chunk;
         pos += chunk;
       }
-      if (status == LINK_STATUS_OK) bytesReturned = got;
+      if (status == LINK_STATUS_OK) {
+        bytesReturned = got;
+        cacheAppend(g_handles[req->handle], req->offset, respBuf + 3, got);
+      }
     }
   }
 
@@ -330,10 +389,10 @@ static void handleRead() {
   sendMessage(LINK_OP_READ, respBuf, (uint16_t)(3 + bytesReturned));
 }
 
-static void handlePoll(uint8_t opcode, bool asserted) {
+static void handlePoll(uint8_t opcode, uint8_t value) {
   LinkPollResponse resp;
   resp.status = LINK_STATUS_OK;
-  resp.asserted = asserted ? 1 : 0;
+  resp.asserted = value;
   sendMessage(opcode, &resp, sizeof(resp));
 }
 
@@ -390,8 +449,8 @@ void link_server_poll() {
     case LINK_OP_OPEN:             handleOpen(); break;
     case LINK_OP_READ:             handleRead(); break;
     case LINK_OP_WRITE:            sendStatus(LINK_OP_WRITE, LINK_STATUS_NOT_IMPLEMENTED); break;
-    case LINK_OP_DISK_CHANGE_POLL: handlePoll(opcode, floppy_disk_change_asserted()); break;
-    case LINK_OP_CARD_POLL:        handlePoll(opcode, g_sdMounted); break;
+    case LINK_OP_DISK_CHANGE_POLL: handlePoll(opcode, floppy_poll_disk_change()); break;
+    case LINK_OP_CARD_POLL:        handlePoll(opcode, g_sdMounted ? 1 : 0); break;
     case LINK_OP_REMOUNT:          handleRemount(); break;
     case LINK_OP_CLOSE:            handleClose(); break;
     default: break; // unknown opcode: stay silent, like any dropped frame

@@ -45,3 +45,10 @@ bool sd_open_file_handle(const SdDirEntry &entry, SdFileHandle *handle);
 
 // Reads up to length bytes at offset; *outGot is short at end of file.
 bool sd_read_file_range(SdFileHandle *handle, uint32_t offset, uint16_t length, uint8_t *out, uint16_t *outGot);
+
+// Floppy cache: /CACHE/<disk id>/<file key>.BIN, written as .TMP and renamed
+// once whole, so a power cut can't leave a partial copy to be served.
+bool sd_cache_open(uint32_t diskId, uint32_t fileKey, SdFileHandle *handle);
+bool sd_cache_begin(uint32_t diskId, uint32_t fileKey, FsFile *out);
+bool sd_cache_finish(uint32_t diskId, uint32_t fileKey, FsFile *file);
+void sd_cache_abandon(uint32_t diskId, uint32_t fileKey, FsFile *file);

@@ -29,10 +29,12 @@ class Backlight:
         return self._path is not None and self._max > 0
 
     def set(self, fraction: float) -> None:
+        """0 is written through: on most panels that turns the backlight off. Anything above it
+        keeps at least the dimmest lit step, so a rounding-down can't look like a dead screen."""
         if not self.available:
             return
-        # Never write 0 - some panels treat it as off, which looks like a crash.
-        level = max(1, round(self._max * max(0.0, min(fraction, 1.0))))
+        fraction = max(0.0, min(fraction, 1.0))
+        level = round(self._max * fraction) if fraction <= 0 else max(1, round(self._max * fraction))
         try:
             (self._path / "brightness").write_text(str(level))
         except OSError as exc:
